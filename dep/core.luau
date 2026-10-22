@@ -6803,7 +6803,7 @@ return M
 
 end)
 __bundle_register("UI/PremiumPopup", function(require, _LOADED, __bundle_register, __bundle_modules)
--- premium upsell popup: slate-styled modal shown when a locked premium element is clicked; shows the pricing link with a copy action and stays until a 5s countdown enables the dismiss button
+-- premium upsell popup: slate-styled modal shown when a locked premium element is clicked; leads with getting premium free on chimera (copies its discord), keeps buying a key as the quieter option, and stays until a 5s countdown enables the dismiss button
 local Executor = require("Utility/Executor")
 local Jobs     = require("Utility/Jobs")
 local Log      = require("Utility/Log")
@@ -6813,8 +6813,13 @@ local TweenService = game:GetService("TweenService")
 
 local M = {}
 
-local PURCHASE_URL  = "https://www.getcerberus.com/pricing"
-local DISMISS_DELAY = 5
+local CHIMERA_DISCORD = "https://discord.gg/fhErCU8GJx"
+local CHIMERA_LOGO    = "rbxassetid://109836038071568"
+local PURCHASE_URL    = "https://www.getcerberus.com/pricing"
+local DISMISS_DELAY   = 5
+
+-- the first perk is the headline, so it is the one filled in
+local PERKS = { "Keyless", "sUNC 100", "Undetected" }
 
 -- only one popup at a time; a second click while it's open is a no-op
 local current = nil
@@ -6831,9 +6836,9 @@ local function schemeFont(Library)
     return Font.fromEnum(Enum.Font.Gotham)
 end
 
-local function copyLink()
-    local ok = Executor.call("setclipboard", PURCHASE_URL)
-    if not ok then ok = Executor.call("toclipboard", PURCHASE_URL) end
+local function copy(text)
+    local ok = Executor.call("setclipboard", text)
+    if not ok then ok = Executor.call("toclipboard", text) end
     return ok == true
 end
 
@@ -6885,7 +6890,7 @@ function M.show(Library)
     card.BackgroundColor3 = MAIN
     card.AnchorPoint = Vector2.new(0.5, 0.5)
     card.Position = UDim2.fromScale(0.5, 0.5)
-    card.Size = UDim2.fromOffset(360, 224)
+    card.Size = UDim2.fromOffset(360, 262)
     card.ZIndex = 1001
     card.Parent = root
     Instance.new("UICorner", card).CornerRadius = UDim.new(0, 12)
@@ -6906,25 +6911,24 @@ function M.show(Library)
     pad.Parent = card
 
     local chip = Instance.new("Frame")
-    chip.BackgroundColor3 = ACCENT
-    chip.Size = UDim2.fromOffset(30, 30)
+    chip.BackgroundColor3 = BG
+    chip.Size = UDim2.fromOffset(34, 34)
     chip.ZIndex = 1002
     chip.Parent = card
-    Instance.new("UICorner", chip).CornerRadius = UDim.new(0, 8)
-    local icon = Library.GetIcon and Library:GetIcon("crown")
-    if type(icon) == "table" and icon.Url then
-        local img = Instance.new("ImageLabel")
-        img.BackgroundTransparency = 1
-        img.AnchorPoint = Vector2.new(0.5, 0.5)
-        img.Position = UDim2.fromScale(0.5, 0.5)
-        img.Size = UDim2.fromOffset(18, 18)
-        img.Image = icon.Url
-        img.ImageRectOffset = icon.ImageRectOffset or Vector2.zero
-        img.ImageRectSize = icon.ImageRectSize or Vector2.zero
-        img.ImageColor3 = BG
-        img.ZIndex = 1003
-        img.Parent = chip
-    end
+    Instance.new("UICorner", chip).CornerRadius = UDim.new(0, 9)
+    local chipStroke = Instance.new("UIStroke")
+    chipStroke.Color = ACCENT
+    chipStroke.Transparency = 0.4
+    chipStroke.Parent = chip
+    local logo = Instance.new("ImageLabel")
+    logo.BackgroundTransparency = 1
+    logo.AnchorPoint = Vector2.new(0.5, 0.5)
+    logo.Position = UDim2.fromScale(0.5, 0.5)
+    logo.Size = UDim2.fromOffset(24, 24)
+    logo.Image = CHIMERA_LOGO
+    logo.ScaleType = Enum.ScaleType.Fit
+    logo.ZIndex = 1003
+    logo.Parent = chip
 
     local function label(text, size, color, transparency, y, height, wrapped)
         local l = Instance.new("TextLabel")
@@ -6944,58 +6948,92 @@ function M.show(Library)
         return l
     end
 
-    label("Premium feature", 18, TEXT, 0, 40, 24)
-    label("You've discovered a premium feature. Unlock the full Cerberus with a key to use it.", 14, TEXT, 0.35, 68, 40, true)
+    label("Go keyless, get this free", 18, TEXT, 0, 44, 24)
+    label("This is a premium feature. Chimera is a fully keyless executor: run Cerberus on it and every premium feature unlocks, no key needed.", 14, TEXT, 0.35, 70, 54, true)
 
-    -- pricing link, shown so it can be typed even where clipboard is unavailable
-    local linkRow = Instance.new("Frame")
-    linkRow.BackgroundColor3 = BG
-    linkRow.Position = UDim2.fromOffset(0, 116)
-    linkRow.Size = UDim2.new(1, 0, 0, 30)
-    linkRow.ZIndex = 1002
-    linkRow.Parent = card
-    Instance.new("UICorner", linkRow).CornerRadius = UDim.new(0, 8)
-    local linkStroke = Instance.new("UIStroke")
-    linkStroke.Color = OUTLINE
-    linkStroke.Parent = linkRow
-    local linkPad = Instance.new("UIPadding")
-    linkPad.PaddingLeft = UDim.new(0, 10)
-    linkPad.PaddingRight = UDim.new(0, 10)
-    linkPad.Parent = linkRow
-    local linkText = Instance.new("TextLabel")
-    linkText.BackgroundTransparency = 1
-    linkText.FontFace = FONT
-    linkText.Text = PURCHASE_URL
-    linkText.TextColor3 = ACCENT
-    linkText.TextSize = 13
-    linkText.TextXAlignment = Enum.TextXAlignment.Left
-    linkText.TextTruncate = Enum.TextTruncate.AtEnd
-    linkText.Size = UDim2.fromScale(1, 1)
-    linkText.ZIndex = 1003
-    linkText.Parent = linkRow
+    local perkRow = Instance.new("Frame")
+    perkRow.BackgroundTransparency = 1
+    perkRow.Position = UDim2.fromOffset(0, 128)
+    perkRow.Size = UDim2.new(1, 0, 0, 22)
+    perkRow.ZIndex = 1002
+    perkRow.Parent = card
+    local perkLayout = Instance.new("UIListLayout")
+    perkLayout.FillDirection = Enum.FillDirection.Horizontal
+    perkLayout.Padding = UDim.new(0, 6)
+    perkLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    perkLayout.Parent = perkRow
+    for i, perk in ipairs(PERKS) do
+        local lead = i == 1
+        local pill = Instance.new("TextLabel")
+        pill.AutomaticSize = Enum.AutomaticSize.X
+        pill.BackgroundColor3 = lead and ACCENT or BG
+        pill.FontFace = FONT
+        pill.Text = perk
+        pill.TextColor3 = lead and BG or ACCENT
+        pill.TextSize = 12
+        pill.Size = UDim2.fromOffset(0, 22)
+        pill.LayoutOrder = i
+        pill.ZIndex = 1003
+        pill.Parent = perkRow
+        Instance.new("UICorner", pill).CornerRadius = UDim.new(0, 6)
+        local pillPad = Instance.new("UIPadding")
+        pillPad.PaddingLeft = UDim.new(0, 9)
+        pillPad.PaddingRight = UDim.new(0, 9)
+        pillPad.Parent = pill
+        local pillStroke = Instance.new("UIStroke")
+        pillStroke.Color = OUTLINE
+        pillStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        pillStroke.Parent = pill
+    end
 
-    -- primary action: copy the link (browser-open isn't reliable across executors)
-    local copyBtn = Instance.new("TextButton")
-    copyBtn.AutoButtonColor = false
-    copyBtn.BackgroundColor3 = ACCENT
-    copyBtn.FontFace = FONT
-    copyBtn.Text = "Copy purchase link"
-    copyBtn.TextColor3 = BG
-    copyBtn.TextSize = 14
-    copyBtn.AnchorPoint = Vector2.new(0, 1)
-    copyBtn.Position = UDim2.fromScale(0, 1)
-    copyBtn.Size = UDim2.new(0.62, -5, 0, 32)
-    copyBtn.ZIndex = 1002
-    copyBtn.Parent = card
-    Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 8)
-    copyBtn.MouseButton1Click:Connect(function()
-        if copyLink() then
-            copyBtn.Text = "Link copied"
-            if Library.Notify then pcall(Library.Notify, Library, "Purchase link copied to clipboard", 4) end
-        else
-            copyBtn.Text = PURCHASE_URL
-        end
-    end)
+    -- a failed copy shows the link itself, so it can still be typed where the clipboard is unavailable
+    local function copyButton(btn, link, done, notice)
+        btn.MouseButton1Click:Connect(function()
+            if copy(link) then
+                btn.Text = done
+                if Library.Notify then pcall(Library.Notify, Library, notice, 4) end
+            else
+                btn.Text = link
+            end
+        end)
+    end
+
+    -- primary action: chimera's discord (browser-open isn't reliable across executors)
+    local chimeraBtn = Instance.new("TextButton")
+    chimeraBtn.AutoButtonColor = false
+    chimeraBtn.BackgroundColor3 = ACCENT
+    chimeraBtn.FontFace = FONT
+    chimeraBtn.Text = "Copy Chimera Discord"
+    chimeraBtn.TextColor3 = BG
+    chimeraBtn.TextSize = 14
+    chimeraBtn.TextTruncate = Enum.TextTruncate.AtEnd
+    chimeraBtn.Position = UDim2.fromOffset(0, 160)
+    chimeraBtn.Size = UDim2.new(1, 0, 0, 32)
+    chimeraBtn.ZIndex = 1002
+    chimeraBtn.Parent = card
+    Instance.new("UICorner", chimeraBtn).CornerRadius = UDim.new(0, 8)
+    copyButton(chimeraBtn, CHIMERA_DISCORD, "Discord link copied", "Chimera Discord link copied to clipboard")
+
+    local buyBtn = Instance.new("TextButton")
+    buyBtn.AutoButtonColor = false
+    buyBtn.BackgroundColor3 = BG
+    buyBtn.FontFace = FONT
+    buyBtn.Text = "Or buy a key"
+    buyBtn.TextColor3 = TEXT
+    buyBtn.TextTransparency = 0.25
+    buyBtn.TextSize = 13
+    buyBtn.TextTruncate = Enum.TextTruncate.AtEnd
+    buyBtn.AnchorPoint = Vector2.new(0, 1)
+    buyBtn.Position = UDim2.fromScale(0, 1)
+    buyBtn.Size = UDim2.new(0.6, -5, 0, 32)
+    buyBtn.ZIndex = 1002
+    buyBtn.Parent = card
+    Instance.new("UICorner", buyBtn).CornerRadius = UDim.new(0, 8)
+    local buyStroke = Instance.new("UIStroke")
+    buyStroke.Color = OUTLINE
+    buyStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    buyStroke.Parent = buyBtn
+    copyButton(buyBtn, PURCHASE_URL, "Purchase link copied", "Purchase link copied to clipboard")
 
     -- dismiss stays disabled until the countdown reaches zero
     local dismissBtn = Instance.new("TextButton")
@@ -7008,12 +7046,13 @@ function M.show(Library)
     dismissBtn.TextSize = 14
     dismissBtn.AnchorPoint = Vector2.new(1, 1)
     dismissBtn.Position = UDim2.fromScale(1, 1)
-    dismissBtn.Size = UDim2.new(0.38, -5, 0, 32)
+    dismissBtn.Size = UDim2.new(0.4, -5, 0, 32)
     dismissBtn.ZIndex = 1002
     dismissBtn.Parent = card
     Instance.new("UICorner", dismissBtn).CornerRadius = UDim.new(0, 8)
     local dismissStroke = Instance.new("UIStroke")
     dismissStroke.Color = OUTLINE
+    dismissStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
     dismissStroke.Parent = dismissBtn
 
     local unlocked = false
