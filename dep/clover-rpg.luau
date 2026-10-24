@@ -16056,8 +16056,9 @@ end
 
 end)
 __bundle_register("Tabs/Player", function(require, _LOADED, __bundle_register, __bundle_modules)
--- player tab: flight, speed and jump on the left, clover utils then the utilities and safety boxes on the right (all through UI/Place); returns the Movement module so Cerberus.lua can re-arm it on respawn
+-- player tab: flight, speed, jump and auto stat on the left, clover utils, the utilities and safety boxes then auto traits on the right (all through UI/Place); returns the Movement module so Cerberus.lua can re-arm it on respawn
 local Host        = require("Tabs/Host")
+local AutoStat    = require("Features/Clover/AutoStat")
 local CloverUtils = require("Features/Clover/PlayerUtils")
 local Movement    = require("Features/Player/Movement")
 local PlayerUtils = require("Features/Player/Utils")
@@ -16077,6 +16078,9 @@ return function(ctx)
     end
     if Config.Movement then
         movementInst = Movement(Host.at(ctx, ctx.Tabs.Player, "Left"))
+    end
+    if Config.AutoStat then
+        AutoStat(Host.at(ctx, ctx.Tabs.Player, { ["Auto Stat"] = "Left", ["Auto Traits"] = "Right" }))
     end
 
     return movementInst
@@ -17861,160 +17865,385 @@ return function(ctx)
 end
 
 end)
-__bundle_register("Tabs/Combat", function(require, _LOADED, __bundle_register, __bundle_modules)
--- combat tab: instakill and auto parry in the left column, the aimbot and spell silent aim in the right; subCtx propagates Unloader since each sub-feature registers root cleanup itself
-local Mount     = require("Utility/Mount")
-local Host      = require("Tabs/Host")
-local SilentAim = require("Features/Clover/SilentAim")
-local Aimbot    = require("Features/Combat/Aimbot")
-local Instakill = require("Features/Main/Instakill")
-local AutoParry = require("Features/Clover/AutoParry")
-
-return function(ctx)
-    local O = Mount.orchestrator(ctx, "Combat")
-    if not O then return end
-
-    local subCtx = O.subCtx({ Unloader = ctx.Unloader })
-    if ctx.Config.Instakill then Instakill(Host.at(ctx, ctx.Tabs.Combat, "Left")) end
-    if ctx.Config.AutoParry then AutoParry(Host.at(ctx, ctx.Tabs.Combat, "Left")) end
-    if ctx.Config.Aimbot    then O.mount(Aimbot, subCtx) end
-    if ctx.Config.SilentAim then SilentAim(Host.at(ctx, ctx.Tabs.Combat, "Right")) end
-
-    O.finalize()
-end
-
-end)
-__bundle_register("Features/Clover/AutoParry", function(require, _LOADED, __bundle_register, __bundle_modules)
--- auto parry box: switches the parry api on for any mob that attacks within the range you set, with a timing nudge, the roll and block fallbacks for a parry the game refuses, and a line of what it has parried and how many attacks it has learned
+__bundle_register("Features/Clover/AutoStat", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto stat: two boxes built through UI/Place (the tab file decides where each goes): Auto Stat spends your stat points as you get them, spreading them toward a goal for each stat that a build fills in (or you set yourself), never past the cap and never on Magic Power before you have magic to power; Auto Traits learns the traits you pick with your skill points as soon as each one's requirements are met, best first, saving up for a better one rather than spending past it
+local Jobs      = require("Utility/Jobs")
 local Log       = require("Utility/Log")
 local Mount     = require("Utility/Mount")
 local Scheduler = require("Utility/Scheduler")
 local Place     = require("UI/Place")
 local Ui        = require("Features/Clover/Gathering/Ui")
 
-local REFRESH_EVERY = 0.5
-local OWNER = "Auto Parry"
+local REFRESH_EVERY = 1
+local IDLE_WAIT = 2
+local SPEND_GAP = 0.25
+-- a stat the server turned down is left alone this long before it is tried again
+local REFUSED_FOR = 60
+local CUSTOM = "Custom"
+local NAMES = { "Vitality", "Endurance", "Strength", "Agility", "Intelligence", "Magic Power" }
+local WHAT = {
+    Vitality       = "more health",
+    Endurance      = "more resolve, so your guard breaks later",
+    Strength       = "harder misdirects, more armor pierce and carry weight",
+    Agility        = "better movement and combat finesse",
+    Intelligence   = "more mana",
+    ["Magic Power"] = "stronger spells",
+}
+-- the goals add up to the 160 or so points a max-level character has; the order breaks ties early on
+local BUILDS = {
+    { name = "Fighter", order = { "Vitality", "Endurance", "Strength", "Agility" },
+      goals = { Vitality = 50, Endurance = 40, Strength = 40, Agility = 30 } },
+    { name = "Tank", order = { "Vitality", "Endurance", "Strength", "Agility" },
+      goals = { Vitality = 50, Endurance = 50, Strength = 30, Agility = 30 } },
+    { name = "Evasion", order = { "Agility", "Vitality", "Strength", "Endurance" },
+      goals = { Agility = 50, Vitality = 40, Strength = 40, Endurance = 30 } },
+    { name = "Mage", order = { "Magic Power", "Intelligence", "Vitality", "Endurance" },
+      goals = { ["Magic Power"] = 50, Intelligence = 40, Vitality = 40, Endurance = 30 } },
+}
+local DEFAULT_BUILD = "Fighter"
+-- the traits worth having for fighting monsters and farming, best first; every other trait follows in name order, off until picked
+local TRAIT_ORDER = {
+    "Weapons Expert", "Mob Slayer", "Rapid Recovery", "Pick-Me-Up", "Bargain Master", "Tempered Body", "Pacifist",
+    "Reinforced Blade", "Survivor's Fury", "Hyper Adrenaline", "Strong Core", "Iron Rebound", "Unyielding Bastion",
+    "Panic Attack", "Steadfast", "Tailwind", "Liver Shot", "Overflow", "Lucky Miner", "Exhaustion Blow", "Spellguard",
+    "Pack Mule", "Graceful Escape", "Deceptive Momentum", "Critical Aerial", "Exhaustion Strike", "Sixth Sense",
+}
+-- what's coming up is listed this many deep
+local UPCOMING = 2
+
+local function idOf(name)
+    return "ASGoal" .. name:gsub("%s", "")
+end
+
+local function buildNamed(name)
+    for _, build in ipairs(BUILDS) do
+        if build.name == name then return build end
+    end
+    return nil
+end
 
 return function(ctx)
-    local O = Mount.orchestrator(ctx, "AutoParry")
+    local O = Mount.orchestrator(ctx, "AutoStat")
     if not O then return end
 
-    local Parry = ctx.Api and ctx.Api.Parry
-    if type(Parry) ~= "table" then
-        Log.devwarn("AutoParry", "the parry api is missing, so auto parry won't load")
+    local Stats = ctx.Api and ctx.Api.Stats
+    if type(Stats) ~= "table" then
+        Log.devwarn("AutoStat", "the stats api is missing, so auto stat won't load")
         return
     end
-    local Toggles, Library = ctx.Toggles, ctx.Library
+    local Library = ctx.Library
 
-    local box = Place.groupbox(ctx, "Auto Parry", "shield", { fallback = "Combat", side = "Left" })
+    local enabled = false
+    local buildName = DEFAULT_BUILD
+    local starting = buildNamed(DEFAULT_BUILD)
+    local goals, order = {}, starting.order
+    for _, name in ipairs(NAMES) do goals[name] = starting.goals[name] or 0 end
+    local refused = {}
+    local spent, lastSpent = 0, nil
+    local job = nil
+    -- set while a build writes the sliders, so those writes don't read as you choosing your own goals
+    local applying = false
+    local sliders, buildPicker, statusLabel = {}, nil, nil
+
+    local box = Place.groupbox(ctx, "Auto Stat", "dumbbell", { fallback = "Player", side = "Left" })
     if not box then return end
 
-    local opts = { range = 30, roll = true, block = true }
-    local token = nil
-
-    local function switch(on)
-        if on and not token then
-            local ok, handle = Parry.request(OWNER, opts)
-            if ok then token = handle end
-        elseif not on and token then
-            Parry.release(token)
-            token = nil
+    local function skipped(view)
+        local now = os.clock()
+        local skip = {}
+        if not view.magic then skip["Magic Power"] = true end
+        for name, untilAt in pairs(refused) do
+            if untilAt > now then skip[name] = true else refused[name] = nil end
         end
+        return skip
     end
 
-    local function adjust()
-        if token then Parry.adjust(token, opts) end
+    local function nextStat(view)
+        return Stats.pick(view.levels, goals, order, view.max, skipped(view))
     end
 
-    box:AddToggle("APEnabled", {
-        Premium  = true,
-        Text     = "Auto Parry",
-        Default  = false,
-        Tooltip  = "Parries monsters' attacks right as they land. It reads when an attack starts, learns how long each one takes, and gets sharper the more it sees.",
-        Callback = function(on) switch(on == true) end,
-    }):AddKeyPicker("APKey", { Premium = true, Default = "None", Mode = "Toggle", Text = "Auto Parry", SyncToggleState = true })
-
-    local depends = box:AddDependencyBox()
-    local statsLabel = depends:AddLabel("Waiting for something to parry.", true)
-    depends:AddSlider("APRange", {
-        Premium  = true,
-        Text     = "Range",
-        Default  = 30,
-        Min      = 8,
-        Max      = 80,
-        Rounding = 0,
-        Suffix   = " studs",
-        Tooltip  = "How close a monster has to be for its attacks to be parried.",
-        Callback = function(value)
-            opts.range = tonumber(value) or opts.range
-            adjust()
-        end,
-    })
-    depends:AddSlider("APTiming", {
-        Premium  = true,
-        Text     = "Timing",
-        Default  = 0,
-        Min      = -150,
-        Max      = 150,
-        Rounding = 0,
-        Suffix   = " ms",
-        Tooltip  = "Parries this much earlier (above 0) or later (below 0) than it has learned. Leave it at 0 unless parries keep landing a touch early or late.",
-        Callback = function(value) Parry.configure({ offset = (tonumber(value) or 0) / 1000 }) end,
-    })
-    depends:AddToggle("APRoll", {
-        Premium  = true,
-        Text     = "Roll When It Can't Parry",
-        Default  = true,
-        Tooltip  = "If the game won't let you parry right then (mid swing, say), rolls through the attack instead.",
-        Callback = function(on)
-            opts.roll = on == true
-            adjust()
-        end,
-    })
-    depends:AddToggle("APBlock", {
-        Premium  = true,
-        Text     = "Block What It Can't Parry",
-        Default  = true,
-        Tooltip  = "Holds block through attacks it hasn't learned yet (it learns their timing from the block), and through any attack it can't parry or roll.",
-        Callback = function(on)
-            opts.block = on == true
-            adjust()
-        end,
-    })
-    depends:AddButton({
-        Premium     = true,
-        Text        = "Forget Learned Timings",
-        DoubleClick = true,
-        Tooltip     = "Starts learning every attack's timing from scratch.",
-        Func        = function() Parry.forget() end,
-    })
-    depends:SetupDependencies({ { Toggles.APEnabled, true } })
-
-    local function statsLine()
-        local ok, s = Parry.stats()
-        if not ok or type(s) ~= "table" then return "Auto parry isn't ready yet." end
+    local function statusLine()
+        local ok, view = Stats.read()
+        if not ok then return "Waiting for your stats to load." end
         local lines = {}
-        if s.pressed + s.rolled + s.blocked + (s.guarded or 0) == 0 then
-            lines[#lines + 1] = "Waiting for something to parry."
+        local points = view.points
+        if points == 1 then
+            lines[1] = "You have 1 stat point to spend."
         else
-            lines[#lines + 1] = ("Parried %s of %s attacks."):format(Ui.commas(s.parried), Ui.commas(s.pressed))
-            if s.rolled + s.blocked > 0 then
-                lines[#lines + 1] = ("Rolled through %s, blocked %s."):format(Ui.commas(s.rolled), Ui.commas(s.blocked))
-            end
-            if (s.guarded or 0) > 0 then
-                lines[#lines + 1] = ("Blocked %s new attacks while learning them."):format(Ui.commas(s.guarded))
-            end
+            lines[1] = ("You have %s stat points to spend."):format(Ui.commas(points))
         end
-        lines[#lines + 1] = ("Knows the timing of %s attacks."):format(Ui.commas(s.learned))
+        local name = nextStat(view)
+        if not enabled then
+            lines[#lines + 1] = "Auto Stat is off."
+        elseif points <= 0 then
+            lines[#lines + 1] = "You get 2 more every time you level up."
+        elseif name then
+            lines[#lines + 1] = ("Spending on %s next (%d of %d)."):format(name, view.levels[name], math.min(goals[name] or 0, view.max))
+        else
+            lines[#lines + 1] = "Every goal is reached. Raise a goal to spend the rest."
+        end
+        local levels = {}
+        for _, stat in ipairs(NAMES) do
+            if stat ~= "Magic Power" or view.magic then levels[#levels + 1] = ("%s %d"):format(stat, view.levels[stat]) end
+        end
+        lines[#lines + 1] = table.concat(levels, ", ")
+        if spent > 0 then lines[#lines + 1] = ("Spent this session: %s (last on %s)"):format(Ui.commas(spent), lastSpent) end
+        if not view.magic and (goals["Magic Power"] or 0) > 0 then
+            lines[#lines + 1] = "Magic Power is saved for when you unlock your magic."
+        end
         return table.concat(lines, "\n")
     end
 
-    O.track(Scheduler.heartbeat(function()
-        if Library and not Library.Toggled then return end
-        Ui.text(statsLabel, statsLine())
-    end, { name = "AutoParry.refresh", interval = REFRESH_EVERY, deferrable = true }))
+    local function loop(j)
+        while j.alive and enabled do
+            local ok, view = Stats.read()
+            local wait = IDLE_WAIT
+            if ok and view.points > 0 then
+                local name = nextStat(view)
+                if name then
+                    local done, result = Stats.spend(name)
+                    if done then
+                        spent, lastSpent = spent + 1, name
+                        wait = SPEND_GAP
+                    elseif result ~= Stats.Errors.NO_POINTS and result ~= Stats.Errors.NOT_READY then
+                        refused[name] = os.clock() + REFUSED_FOR
+                        Log.devwarn("AutoStat", "a point on %s was not taken: %s", name, tostring(result))
+                    end
+                end
+            end
+            if not j:sleep(wait) then return end
+        end
+    end
 
-    O.onUnload(function() switch(false) end)
+    local function start()
+        if job and job.alive then return end
+        job = O.track(Jobs.spawn(loop, { name = "AutoStat" }))
+    end
+
+    local function stop()
+        if job then pcall(job.Cancel, job) end
+        job = nil
+    end
+
+    local function applyBuild(name)
+        local build = buildNamed(name)
+        buildName = name
+        if not build then
+            order = NAMES
+            return
+        end
+        order = build.order
+        applying = true
+        for _, stat in ipairs(NAMES) do
+            local goal = build.goals[stat] or 0
+            goals[stat] = goal
+            if sliders[stat] and sliders[stat].Value ~= goal then Ui.set(sliders[stat], goal) end
+        end
+        applying = false
+    end
+
+    box:AddLabel("Spends your stat points for you as you level up, spreading them toward the goal you set for each stat.", true)
+    box:AddToggle("ASEnabled", {
+        Text     = "Auto Stat",
+        Default  = false,
+        Tooltip  = "Spends every stat point you have, and each new one as you level up. Points already spent stay where they are, so pick your build before switching this on.",
+        Callback = function(on)
+            enabled = on == true
+            if enabled then start() else stop() end
+        end,
+    })
+    local buildNames = {}
+    for i, build in ipairs(BUILDS) do buildNames[i] = build.name end
+    buildNames[#buildNames + 1] = CUSTOM
+    buildPicker = box:AddDropdown("ASBuild", {
+        Text     = "Build",
+        Values   = buildNames,
+        Default  = DEFAULT_BUILD,
+        Tooltip  = "Fighter: health, resolve and strength for fist and weapon fights. Tank: as much health and resolve as possible. Evasion: agility first, for dodging. Mage: for when you have magic. Custom: set every goal yourself.",
+        Callback = function(value)
+            if applying or type(value) ~= "string" then return end
+            if value == CUSTOM then
+                buildName, order = CUSTOM, NAMES
+            else
+                applyBuild(value)
+            end
+        end,
+    })
+    for _, stat in ipairs(NAMES) do
+        sliders[stat] = box:AddSlider(idOf(stat), {
+            Text     = stat .. " Goal",
+            Default  = goals[stat],
+            Min      = 0,
+            Max      = Stats.MAX,
+            Rounding = 0,
+            Tooltip  = ("How high to raise %s (%s). The most it goes is %d."):format(stat, WHAT[stat], Stats.MAX),
+            Callback = function(value)
+                goals[stat] = tonumber(value) or 0
+                if applying or buildName == CUSTOM then return end
+                local build = buildNamed(buildName)
+                if build and (build.goals[stat] or 0) ~= goals[stat] then
+                    buildName, order = CUSTOM, NAMES
+                    applying = true
+                    Ui.set(buildPicker, CUSTOM)
+                    applying = false
+                end
+            end,
+        })
+    end
+    statusLabel = box:AddLabel("Waiting for your stats to load.", true)
+
+    -- ===== auto traits =====
+    local traitsOn = false
+    local traitOrder, traitWanted = {}, {}
+    for _, name in ipairs(TRAIT_ORDER) do traitWanted[name] = true end
+    local traitRefused = {}
+    local learned = {}
+    local traitJob = nil
+    local traitPicker, traitLabel = nil, nil
+    local traitsLoaded = false
+
+    local function wantedOrder()
+        local now = os.clock()
+        local out = {}
+        for _, name in ipairs(traitOrder) do
+            local refusedUntil = traitRefused[name]
+            if traitWanted[name] and not (refusedUntil and refusedUntil > now) then out[#out + 1] = name end
+        end
+        return out
+    end
+
+    local function traitLoop(j)
+        while j.alive and traitsOn do
+            local wait = IDLE_WAIT
+            local okList, list = Stats.traits()
+            local okView, view = Stats.read()
+            if okList and okView and view.skillPoints > 0 then
+                local pick = Stats.pickTrait(list, wantedOrder(), view.skillPoints)
+                if pick then
+                    local done, result = Stats.learn(pick.name)
+                    if done then
+                        learned[#learned + 1] = pick.name
+                        wait = SPEND_GAP
+                    elseif result ~= Stats.Errors.NOT_READY and result ~= Stats.Errors.NO_POINTS then
+                        traitRefused[pick.name] = os.clock() + REFUSED_FOR
+                        Log.devwarn("AutoStat", "learning %s didn't work: %s", pick.name, tostring(result))
+                    end
+                end
+            end
+            if not j:sleep(wait) then return end
+        end
+    end
+
+    local function startTraits()
+        if traitJob and traitJob.alive then return end
+        traitJob = O.track(Jobs.spawn(traitLoop, { name = "AutoStat.traits" }))
+    end
+
+    local function stopTraits()
+        if traitJob then pcall(traitJob.Cancel, traitJob) end
+        traitJob = nil
+    end
+
+    -- the picker lists the traits best first, so the order you see is the order they are learned in
+    local function loadTraits()
+        local ok, list = Stats.traits()
+        if not ok or #list == 0 then return end
+        local known, order = {}, {}
+        for _, entry in ipairs(list) do known[entry.name] = true end
+        for _, name in ipairs(TRAIT_ORDER) do
+            if known[name] then
+                order[#order + 1] = name
+                known[name] = nil
+            end
+        end
+        local rest = {}
+        for name in pairs(known) do rest[#rest + 1] = name end
+        table.sort(rest)
+        for _, name in ipairs(rest) do order[#order + 1] = name end
+        traitOrder = order
+        Ui.values(traitPicker, order)
+        traitsLoaded = true
+    end
+
+    local function traitLine()
+        local okList, list = Stats.traits()
+        local okView, view = Stats.read()
+        if not (okList and okView) then return "Waiting for your traits to load." end
+        local lines = {}
+        local points = view.skillPoints
+        lines[1] = points == 1 and "You have 1 skill point." or ("You have %s skill points."):format(Ui.commas(points))
+        local order = wantedOrder()
+        local pick, saving = Stats.pickTrait(list, order, points)
+        if not traitsOn then
+            lines[#lines + 1] = "Auto Traits is off."
+        elseif pick then
+            lines[#lines + 1] = ("Learning %s next."):format(pick.name)
+        elseif saving then
+            lines[#lines + 1] = ("Saving up for %s (%d points)."):format(saving.name, saving.points)
+        end
+        local byName = {}
+        for _, entry in ipairs(list) do byName[entry.name] = entry end
+        local shown = 0
+        for _, name in ipairs(order) do
+            local entry = byName[name]
+            if entry and not entry.owned and not entry.ready and shown < UPCOMING then
+                shown = shown + 1
+                lines[#lines + 1] = ("Later: %s, needs %s."):format(name, table.concat(entry.missing, ", "))
+            end
+        end
+        local owned = 0
+        for _, entry in ipairs(list) do
+            if entry.owned then owned = owned + 1 end
+        end
+        lines[#lines + 1] = ("Traits you have: %d of %d"):format(owned, #list)
+        if #learned > 0 then lines[#lines + 1] = ("Learned this session: %s"):format(table.concat(learned, ", ")) end
+        return Ui.clean(table.concat(lines, "\n"))
+    end
+
+    local traitBox = Place.groupbox(ctx, "Auto Traits", "award", { fallback = "Player", side = "Right" })
+    if traitBox then
+        traitBox:AddLabel("Learns traits with your skill points as soon as you can have them, in the order of the list below. You don't need to visit anyone.", true)
+        traitBox:AddToggle("ATEnabled", {
+            Text     = "Auto Traits",
+            Default  = false,
+            Tooltip  = "Learns the traits you pick, best first, each one as soon as you meet what it needs. When the next one costs more points than you have, it saves up for it instead of spending them on a worse one.",
+            Callback = function(on)
+                traitsOn = on == true
+                if traitsOn then startTraits() else stopTraits() end
+            end,
+        })
+        traitPicker = traitBox:AddDropdown("ATList", {
+            Text       = "Traits to Learn",
+            Values     = TRAIT_ORDER,
+            Default    = TRAIT_ORDER,
+            Multi      = true,
+            Searchable = true,
+            Tooltip    = "Which traits to learn, listed best first for fighting monsters. Hover a trait in the game's trait page to read what it does.",
+            Callback   = function(value)
+                local set = {}
+                if type(value) == "table" then
+                    for key, on in pairs(value) do
+                        if type(key) == "string" and on == true then set[key] = true end
+                    end
+                end
+                traitWanted = set
+            end,
+        })
+        traitLabel = traitBox:AddLabel("Waiting for your traits to load.", true)
+    end
+    loadTraits()
+
+    O.track(Scheduler.heartbeat(function()
+        if not traitsLoaded then loadTraits() end
+        if Library and not Library.Toggled then return end
+        Ui.text(statusLabel, statusLine())
+        Ui.text(traitLabel, traitLine())
+    end, { name = "AutoStat.refresh", interval = REFRESH_EVERY, deferrable = true }))
+
+    O.onUnload(function()
+        stop()
+        stopTraits()
+    end)
     O.finalize()
 end
 
@@ -18112,13 +18341,197 @@ end
 return M
 
 end)
-__bundle_register("Features/Main/Instakill", function(require, _LOADED, __bundle_register, __bundle_modules)
--- instakill: kills nearby mobs via network-ownership writes + a network ownership viewer
-local Executor  = require("Utility/Executor")
+__bundle_register("Tabs/Combat", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- combat tab: instakill and auto parry in the left column, the aimbot and spell silent aim in the right; subCtx propagates Unloader since each sub-feature registers root cleanup itself
+local Mount     = require("Utility/Mount")
+local Host      = require("Tabs/Host")
+local SilentAim = require("Features/Clover/SilentAim")
+local Aimbot    = require("Features/Combat/Aimbot")
+local Instakill = require("Features/Main/Instakill")
+local AutoParry = require("Features/Clover/AutoParry")
+
+return function(ctx)
+    local O = Mount.orchestrator(ctx, "Combat")
+    if not O then return end
+
+    local subCtx = O.subCtx({ Unloader = ctx.Unloader })
+    if ctx.Config.Instakill then Instakill(Host.at(ctx, ctx.Tabs.Combat, "Left")) end
+    if ctx.Config.AutoParry then AutoParry(Host.at(ctx, ctx.Tabs.Combat, "Left")) end
+    if ctx.Config.Aimbot    then O.mount(Aimbot, subCtx) end
+    if ctx.Config.SilentAim then SilentAim(Host.at(ctx, ctx.Tabs.Combat, "Right")) end
+
+    O.finalize()
+end
+
+end)
+__bundle_register("Features/Clover/AutoParry", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- auto parry box: switches the parry api on for any mob that attacks within the range you set, with a timing nudge, the roll and block fallbacks for a parry the game refuses, and a line of what it has parried and how many attacks it has learned
+local Log       = require("Utility/Log")
 local Mount     = require("Utility/Mount")
 local Scheduler = require("Utility/Scheduler")
-local VMath     = require("Utility/Helpers/VMath")
 local Place     = require("UI/Place")
+local Ui        = require("Features/Clover/Gathering/Ui")
+
+local REFRESH_EVERY = 0.5
+local OWNER = "Auto Parry"
+
+return function(ctx)
+    local O = Mount.orchestrator(ctx, "AutoParry")
+    if not O then return end
+
+    local Parry = ctx.Api and ctx.Api.Parry
+    if type(Parry) ~= "table" then
+        Log.devwarn("AutoParry", "the parry api is missing, so auto parry won't load")
+        return
+    end
+    local Toggles, Library = ctx.Toggles, ctx.Library
+
+    local box = Place.groupbox(ctx, "Auto Parry", "shield", { fallback = "Combat", side = "Left" })
+    if not box then return end
+
+    local opts = { range = 30, roll = true, block = true, dodge = true }
+    local token = nil
+
+    local function switch(on)
+        if on and not token then
+            local ok, handle = Parry.request(OWNER, opts)
+            if ok then token = handle end
+        elseif not on and token then
+            Parry.release(token)
+            token = nil
+        end
+    end
+
+    local function adjust()
+        if token then Parry.adjust(token, opts) end
+    end
+
+    box:AddToggle("APEnabled", {
+        Premium  = true,
+        Text     = "Auto Parry",
+        Default  = false,
+        Tooltip  = "Parries monsters' attacks right as they land. It reads when an attack starts, learns how long each one takes, and gets sharper the more it sees.",
+        Callback = function(on) switch(on == true) end,
+    }):AddKeyPicker("APKey", { Premium = true, Default = "None", Mode = "Toggle", Text = "Auto Parry", SyncToggleState = true })
+
+    local depends = box:AddDependencyBox()
+    local statsLabel = depends:AddLabel("Waiting for something to parry.", true)
+    depends:AddSlider("APRange", {
+        Premium  = true,
+        Text     = "Range",
+        Default  = 30,
+        Min      = 8,
+        Max      = 80,
+        Rounding = 0,
+        Suffix   = " studs",
+        Tooltip  = "How close a monster has to be for its attacks to be parried.",
+        Callback = function(value)
+            opts.range = tonumber(value) or opts.range
+            adjust()
+        end,
+    })
+    depends:AddSlider("APTiming", {
+        Premium  = true,
+        Text     = "Timing",
+        Default  = 0,
+        Min      = -150,
+        Max      = 150,
+        Rounding = 0,
+        Suffix   = " ms",
+        Tooltip  = "Parries this much earlier (above 0) or later (below 0) than it has learned. Leave it at 0 unless parries keep landing a touch early or late.",
+        Callback = function(value) Parry.configure({ offset = (tonumber(value) or 0) / 1000 }) end,
+    })
+    depends:AddToggle("APRoll", {
+        Premium  = true,
+        Text     = "Roll When It Can't Parry",
+        Default  = true,
+        Tooltip  = "If the game won't let you parry right then (mid swing, say), rolls through the attack instead.",
+        Callback = function(on)
+            opts.roll = on == true
+            adjust()
+        end,
+    })
+    depends:AddToggle("APDodge", {
+        Premium  = true,
+        Text     = "Roll Through Special Attacks",
+        Default  = true,
+        Tooltip  = "A monster's special attacks (the big ones it can't be stopped out of) are rolled through instead of parried, timed so the roll's dodge frames are on as it lands. If the roll isn't ready it parries or blocks instead.",
+        Callback = function(on)
+            opts.dodge = on == true
+            adjust()
+        end,
+    })
+    depends:AddToggle("APBlock", {
+        Premium  = true,
+        Text     = "Block What It Can't Parry",
+        Default  = true,
+        Tooltip  = "Holds block through attacks it hasn't learned yet (it learns their timing from the block), and through any attack it can't parry or roll.",
+        Callback = function(on)
+            opts.block = on == true
+            adjust()
+        end,
+    })
+    depends:AddButton({
+        Premium     = true,
+        Text        = "Forget Learned Timings",
+        DoubleClick = true,
+        Tooltip     = "Starts learning every attack's timing from scratch.",
+        Func        = function() Parry.forget() end,
+    })
+    depends:SetupDependencies({ { Toggles.APEnabled, true } })
+
+    local function statsLine()
+        local ok, s = Parry.stats()
+        if not ok or type(s) ~= "table" then return "Auto parry isn't ready yet." end
+        local lines = {}
+        if s.pressed + s.rolled + s.blocked + (s.guarded or 0) == 0 then
+            lines[#lines + 1] = "Waiting for something to parry."
+        else
+            lines[#lines + 1] = ("Parried %s of %s attacks."):format(Ui.commas(s.parried), Ui.commas(s.pressed))
+            if s.rolled + s.blocked > 0 then
+                lines[#lines + 1] = ("Rolled through %s, blocked %s."):format(Ui.commas(s.rolled), Ui.commas(s.blocked))
+            end
+            if (s.guarded or 0) > 0 then
+                lines[#lines + 1] = ("Blocked %s new attacks while learning them."):format(Ui.commas(s.guarded))
+            end
+        end
+        lines[#lines + 1] = ("Knows the timing of %s attacks."):format(Ui.commas(s.learned))
+        return table.concat(lines, "\n")
+    end
+
+    O.track(Scheduler.heartbeat(function()
+        if Library and not Library.Toggled then return end
+        Ui.text(statsLabel, statsLine())
+    end, { name = "AutoParry.refresh", interval = REFRESH_EVERY, deferrable = true }))
+
+    O.onUnload(function() switch(false) end)
+    O.finalize()
+end
+
+end)
+__bundle_register("Features/Main/Instakill", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- instakill: watches the enemies round you (workspace.FightableNPCS, so never a player, a quest giver or a villager) every frame and finishes one on every frame this client is the one simulating its body, the only time the server takes a death from us (some moves and crits hand it over for a moment, the user 2026-10-24; otherwise every Clover mob is server-owned, even at 6 studs, and a health write only fools our own farm into reading it dead); plus a network ownership viewer
+local CoreServices = require("Services")
+local Executor     = require("Utility/Executor")
+local Mount        = require("Utility/Mount")
+local Scheduler    = require("Utility/Scheduler")
+local Place        = require("UI/Place")
+local Ui           = require("Features/Clover/Gathering/Ui")
+
+local ENEMIES = "FightableNPCS"
+local ENEMY_TAG = "EnemyNPC"
+-- the enemies in range are listed this often, and the listed ones checked for ownership every frame
+local LIST_EVERY = 0.25
+local MAX_WATCHED = 12
+-- a window is finished on every frame of it up to this many, and one that gaps this long is a new window
+local FRAMES = 30
+local WINDOW_GAP = 0.5
+-- under workspace.FallenPartsDestroyHeight the server deletes the body, which always kills it; dropped only once a window has lasted this long without the finish taking
+local VOID_BELOW = 100
+local VOID_AFTER = 0.15
+-- an enemy gone from the world this soon after a window counts as a kill
+local KILL_CREDIT = 5
+local REFRESH_EVERY = 1
 
 return function(ctx)
     local O = Mount.orchestrator(ctx, "Instakill")
@@ -18129,247 +18542,182 @@ return function(ctx)
     local Library = ctx.Library
     local Toggles = ctx.Toggles
     local track = O.track
+    local CollectionService = CoreServices.CollectionService
 
     local InstakillGroupbox = Place.groupbox(ctx, "Instakill", "skull", { fallback = "Combat", side = "Left" })
     if not InstakillGroupbox then return {} end
 
-    local S = { on = false, range = 150, thr = 90, acc = 0, tick = nil, addConn = nil }
-    local pool = {}
+    local S = {
+        on = false, range = 150, thr = 90, skipGuards = true, void = false,
+        list = nil, tick = nil, watched = {}, chances = 0, kills = 0, voided = 0,
+    }
+    -- per model: when its current ownership window opened and how many finishes it has had in it
+    local windows = setmetatable({}, { __mode = "k" })
 
-    local SWEEP_INTERVAL    = 0.12
-    local KILL_BUDGET       = 4      -- max kills initiated per sweep
-    local RETRY_BACKOFF     = 0.5    -- per-target cooldown after a failed kill
-    local MAX_KILL_ATTEMPTS = 8
-    local KILL_DEADLINE     = 0.25
+    local isOwnerFn = Executor.get("isnetworkowner")
+    if type(isOwnerFn) ~= "function" then isOwnerFn = nil end
 
-    local simRadiusOrig = nil
-    local simRadiusSnapshotted = false
-    local simRadiusBoosted = false
-
-    local function snapshotSimRadius()
-        if simRadiusSnapshotted then return end
-        simRadiusSnapshotted = true
-        if not (References.player and gethiddenproperty) then return end
-        local okRadius, valRadius = pcall(gethiddenproperty, References.player, "SimulationRadius")
-        local okMax,    valMax    = pcall(gethiddenproperty, References.player, "MaxSimulationRadius")
-        simRadiusOrig = {
-            radius = okRadius and valRadius or nil,
-            max    = okMax    and valMax    or nil,
-        }
-    end
-
+    -- the widest simulation radius, so a body the server lets go of is ours rather than someone else's; put back as it was when this stops
+    local simRadius = nil
     local function boostSimRadius()
-        if simRadiusBoosted then return end
-        snapshotSimRadius()
-        if not (References.player and sethiddenproperty) then return end
-        simRadiusBoosted = true
-        pcall(sethiddenproperty, References.player, "SimulationRadius", 1e5)
-        pcall(sethiddenproperty, References.player, "MaxSimulationRadius", 1e5)
+        local player = References.player
+        if simRadius or not (player and gethiddenproperty and sethiddenproperty) then return end
+        local okR, radius = pcall(gethiddenproperty, player, "SimulationRadius")
+        local okM, max = pcall(gethiddenproperty, player, "MaxSimulationRadius")
+        simRadius = { radius = okR and radius or nil, max = okM and max or nil }
+        pcall(sethiddenproperty, player, "SimulationRadius", 1e5)
+        pcall(sethiddenproperty, player, "MaxSimulationRadius", 1e5)
     end
 
     local function restoreSimRadius()
-        if not simRadiusBoosted then return end
-        simRadiusBoosted = false
-        if not (simRadiusSnapshotted and simRadiusOrig and References.player and sethiddenproperty) then return end
-        if simRadiusOrig.radius ~= nil then
-            pcall(sethiddenproperty, References.player, "SimulationRadius", simRadiusOrig.radius)
-        end
-        if simRadiusOrig.max ~= nil then
-            pcall(sethiddenproperty, References.player, "MaxSimulationRadius", simRadiusOrig.max)
-        end
+        local player = References.player
+        local was = simRadius
+        simRadius = nil
+        if not (was and player and sethiddenproperty) then return end
+        if was.radius ~= nil then pcall(sethiddenproperty, player, "SimulationRadius", was.radius) end
+        if was.max ~= nil then pcall(sethiddenproperty, player, "MaxSimulationRadius", was.max) end
     end
 
-    local function isOurChar(m)
-        if not m then return false end
-        if m == References.character then return true end
-        local plr = Services.Players:GetPlayerFromCharacter(m)
-        return plr ~= nil and plr == References.player
+    -- cloneref'd handles never compare equal, so players are told apart by name
+    local function isPlayerModel(m)
+        if Services.Players:GetPlayerFromCharacter(m) ~= nil then return true end
+        return Services.Players:FindFirstChild(m.Name) ~= nil
     end
 
-    local function isOtherPlayerModel(m)
-        local plr = Services.Players:GetPlayerFromCharacter(m)
-        return plr ~= nil and plr ~= References.player
+    local function wanted(m)
+        if not (m:IsA("Model") and CollectionService:HasTag(m, ENEMY_TAG)) then return nil end
+        if isPlayerModel(m) then return nil end
+        if S.skipGuards and string.find(m.Name, "Guard", 1, true) then return nil end
+        local h = m:FindFirstChildOfClass("Humanoid")
+        local r = m:FindFirstChild("HumanoidRootPart")
+        if not (h and r) or h.Health <= 0 then return nil end
+        return h, r
     end
 
-    local function unenroll(m)
-        if m == nil then return end
-        local t = pool[m]
-        if not t then return end
-        if t.diedConn then pcall(function() t.diedConn:Disconnect() end) end
-        pool[m] = nil
+    local function owned(part)
+        if not isOwnerFn then return false end
+        local ok, value = pcall(isOwnerFn, part)
+        return ok and value == true
     end
 
-    local function enroll(m, h, r)
-        if pool[m] then return end
-        local entry = { h = h, r = r, killing = false, nextAttempt = 0 }
-        -- capture entry identity so respawn-after-unenroll doesn't double-fire
-        entry.diedConn = h.Died:Connect(function()
-            if pool[m] == entry then unenroll(m) end
-        end)
-        pool[m] = entry
-    end
-
-    -- Humanoid or HumanoidRootPart can be parented after the Model, so enroll on either signal
-    local function qualify(m)
-        if not (m and m:IsA("Model")) then return end
-        if pool[m] then return end
-        if isOurChar(m) then return end
-        if isOtherPlayerModel(m) then return end
-        local h = m:FindFirstChildOfClass("Humanoid"); if not h then return end
-        local r = m:FindFirstChild("HumanoidRootPart"); if not r then return end
-        enroll(m, h, r)
-    end
-
-    local function seedPool()
-        for _, d in ipairs(Services.Workspace:GetDescendants()) do
-            if d:IsA("Humanoid") then qualify(d.Parent) end
-        end
-    end
-
-    local function hookAdds()
-        if S.addConn then S.addConn:Disconnect() end
-        S.addConn = track(Services.Workspace.DescendantAdded:Connect(function(d)
-            if d:IsA("Humanoid") then
-                qualify(d.Parent)
-            elseif d.Name == "HumanoidRootPart" and d:IsA("BasePart") then
-                qualify(d.Parent)
-            end
-        end))
-    end
-
-    local function unhookAdds()
-        if S.addConn then
-            S.addConn:Disconnect(); S.addConn = nil
-        end
-    end
-
-    -- kill loop yields off the Heartbeat callback so a 30-mob horde doesn't stall the main thread
-    local function killAsync(m, t)
-        if t.killing then return end
-        t.killing = true
-        task.spawn(function()
-            local h, r = t.h, t.r
-            local lpRoot = References.humanoidRootPart
-            local gone = false
-
-            if m and h and r and lpRoot then
-                local extra = {}
-                for _, d in ipairs(m:GetDescendants()) do
-                    if d:IsA("BasePart") then
-                        pcall(function() d:SetNetworkOwner(References.player) end)
-                    elseif d:IsA("NumberValue") or d:IsA("IntValue") then
-                        local n = d.Name:lower()
-                        if n == "health" or n == "hp" or n == "currenthealth" or n == "currenthp" then
-                            extra[#extra + 1] = d
-                        end
-                    end
-                end
-
-                local deadline = os.clock() + KILL_DEADLINE
-                local maxhp = (h.MaxHealth and h.MaxHealth > 0) and h.MaxHealth or 100
-                local lethal = maxhp * 10 + 1000
-
-                for _ = 1, MAX_KILL_ATTEMPTS do
-                    pcall(function() h:TakeDamage(lethal) end)
-                    pcall(function() h.Health = 0 end)
-                    pcall(function() h:ChangeState(Enum.HumanoidStateType.Dead) end)
-                    for i = 1, #extra do pcall(function() extra[i].Value = 0 end) end
-                    pcall(function() m:SetAttribute("CurrentState", "Unconscious") end)
-                    if (not m.Parent) or os.clock() > deadline then break end
-                    task.wait()
-                end
-
-                gone = (not m.Parent)
-                    or (not m:FindFirstChildOfClass("Humanoid"))
-                    or (h.Health <= 0)
-            end
-
-            if gone then
-                unenroll(m)
-            else
-                t.nextAttempt = os.clock() + RETRY_BACKOFF
-                t.killing = false
-            end
-        end)
-    end
-
-    -- parallel arrays reused across sweeps to avoid per-frame allocations
-    local cM, cT, cD = {}, {}, {}
-
-    local function sweep()
-        if not References.humanoidRootPart then return end
-        local rootPos = References.humanoidRootPart.Position
-        local range2 = S.range * S.range
+    -- a kill is an enemy that left the world soon after a window; one still there has had its chance
+    local function settleWindows(folder)
         local now = os.clock()
-        local n = 0
+        for m, w in pairs(windows) do
+            if m.Parent ~= folder then
+                windows[m] = nil
+                if now - w.last <= KILL_CREDIT then S.kills = S.kills + 1 end
+            elseif now - w.last > KILL_CREDIT then
+                windows[m] = nil
+            end
+        end
+    end
 
-        for m, t in pairs(pool) do
-            local h, r = t.h, t.r
-            if (not m) or (not m.Parent) or (not h) or (not h.Parent) or (h.Parent ~= m) then
-                unenroll(m)
-            elseif (not t.killing) and now >= t.nextAttempt and h.Health > 0 then
-                local stateOk = true
-                local okState, st = pcall(h.GetState, h)
-                if okState and st == Enum.HumanoidStateType.Dead then stateOk = false end
-                if stateOk then
-                    local d2 = VMath.distanceSqr3(rootPos, r.Position)
-                    if d2 <= range2 then
-                        local max = (h.MaxHealth and h.MaxHealth > 0) and h.MaxHealth or 100
-                        local pct = (h.Health / max) * 100
-                        if pct <= S.thr then
-                            n = n + 1
-                            cM[n], cT[n], cD[n] = m, t, d2
-                        end
-                    end
+    local function listEnemies()
+        local watched = {}
+        local root = References.humanoidRootPart
+        local folder = Services.Workspace:FindFirstChild(ENEMIES)
+        if not (root and folder) then
+            S.watched = watched
+            return
+        end
+        settleWindows(folder)
+        local here = root.Position
+        local range2 = S.range * S.range
+        for _, m in ipairs(folder:GetChildren()) do
+            local h, r = wanted(m)
+            if h then
+                local offset = r.Position - here
+                local d2 = offset:Dot(offset)
+                local max = h.MaxHealth > 0 and h.MaxHealth or 100
+                if d2 <= range2 and h.Health / max * 100 <= S.thr then
+                    watched[#watched + 1] = { m = m, h = h, r = r, d2 = d2 }
                 end
             end
         end
+        table.sort(watched, function(a, b) return a.d2 < b.d2 end)
+        while #watched > MAX_WATCHED do table.remove(watched) end
+        S.watched = watched
+    end
 
-        if n == 0 then return end
-
-        -- partial selection sort: only the KILL_BUDGET nearest are needed
-        local budget = math.min(KILL_BUDGET, n)
-        for i = 1, budget do
-            local minIdx = i
-            local minD = cD[i]
-            for j = i + 1, n do
-                if cD[j] < minD then minIdx = j; minD = cD[j] end
+    local function finish(e)
+        local h, m = e.h, e.m
+        pcall(function() h:TakeDamage(h.MaxHealth * 10 + 1000) end)
+        pcall(function() h.Health = 0 end)
+        pcall(function() h:ChangeState(Enum.HumanoidStateType.Dead) end)
+        for _, d in ipairs(m:GetChildren()) do
+            if d:IsA("NumberValue") or d:IsA("IntValue") then
+                local n = string.lower(d.Name)
+                if n == "health" or n == "hp" then pcall(function() d.Value = 0 end) end
             end
-            if minIdx ~= i then
-                cM[i], cM[minIdx] = cM[minIdx], cM[i]
-                cT[i], cT[minIdx] = cT[minIdx], cT[i]
-                cD[i], cD[minIdx] = cD[minIdx], cD[i]
-            end
-            killAsync(cM[i], cT[i])
         end
+    end
 
-        for i = 1, n do cM[i] = nil; cT[i] = nil; cD[i] = nil end
+    -- an enemy welded to us (gripping or carried) moves with our own body, so it is never dragged anywhere
+    local function attachedToUs(part)
+        local char = References.character
+        if not char then return true end
+        local ok, assembly = pcall(function() return part.AssemblyRootPart end)
+        if not ok or assembly == nil then return true end
+        return assembly:IsDescendantOf(char)
+    end
+
+    local function voidDrop(e)
+        local r = e.r
+        if attachedToUs(r) then return false end
+        local below = Services.Workspace.FallenPartsDestroyHeight - VOID_BELOW
+        return pcall(function()
+            r.AssemblyLinearVelocity = Vector3.new(0, -500, 0)
+            r.CFrame = CFrame.new(r.Position.X, below, r.Position.Z)
+        end)
+    end
+
+    -- every frame, only over the few enemies listed: a window can be a single frame long
+    local function watch()
+        local now = os.clock()
+        for _, e in ipairs(S.watched) do
+            local m = e.m
+            if m.Parent and owned(e.r) then
+                local w = windows[m]
+                if not w or now - w.last > WINDOW_GAP then
+                    w = { opened = now, last = now, frames = 0, voided = false }
+                    windows[m] = w
+                    S.chances = S.chances + 1
+                end
+                w.last = now
+                if w.frames < FRAMES then
+                    w.frames = w.frames + 1
+                    finish(e)
+                end
+                if S.void and not w.voided and now - w.opened >= VOID_AFTER and voidDrop(e) then
+                    w.voided = true
+                    S.voided = S.voided + 1
+                end
+            end
+        end
     end
 
     local function startIK()
         if S.tick then return end
         boostSimRadius()
-        hookAdds()
-        seedPool()
-        S.acc = 0
-        S.tick = track(Scheduler.heartbeat(function()
-            pcall(sweep)
-        end, { name = "Instakill", priority = 80, interval = SWEEP_INTERVAL }))
+        listEnemies()
+        S.list = track(Scheduler.heartbeat(function() pcall(listEnemies) end, { name = "Instakill.list", interval = LIST_EVERY }))
+        S.tick = track(Scheduler.heartbeat(function() pcall(watch) end, { name = "Instakill", priority = 80 }))
     end
 
     local function stopIK()
-        if S.tick then
-            S.tick:Disconnect(); S.tick = nil
-        end
-        unhookAdds()
+        if S.tick then S.tick:Disconnect(); S.tick = nil end
+        if S.list then S.list:Disconnect(); S.list = nil end
+        S.watched = {}
         restoreSimRadius()
-        for m in pairs(pool) do unenroll(m) end
     end
+
+    InstakillGroupbox:AddLabel("Finishes an enemy the moment your game is the one moving it. Clover RPG keeps that for itself most of the time, so this only gets a chance now and then. It never touches players or friendly people.", true)
 
     InstakillGroupbox:AddToggle("IK_Toggle", {
         Premium = true,
         Text = "Instakill",
-        Tooltip = "This ONLY works on mobs NOT players, and only sometimes.",
+        Tooltip = "Watches the enemies near you and finishes one as soon as it gets the chance. Only works on monsters, never on players.",
         Default = false,
         Callback = function(v)
             S.on = v
@@ -18382,7 +18730,7 @@ return function(ctx)
     IKBox:AddSlider("IK_Range", {
         Premium = true,
         Text = "Range",
-        Default = 150, Min = 10, Max = 5000, Rounding = 0,
+        Default = 150, Min = 10, Max = 1000, Rounding = 0,
         Suffix = " studs",
         Callback = function(v) S.range = v end
     })
@@ -18392,21 +18740,39 @@ return function(ctx)
         Text = "Health Threshold",
         Default = 90, Min = 0, Max = 100, Rounding = 0,
         Suffix = "%",
-        Tooltip = "Kill when target HP% is at/below this value",
+        Tooltip = "Only goes for enemies at or below this much health. 100 means any enemy.",
         Callback = function(v) S.thr = v end
     })
+
+    IKBox:AddToggle("IK_SkipGuards", {
+        Premium = true,
+        Text = "Leave Guards Alone",
+        Tooltip = "Town guards are enemies the game lets you fight. With this on they are never targeted.",
+        Default = true,
+        Callback = function(v) S.skipGuards = v == true end
+    })
+
+    IKBox:AddToggle("IK_Void", {
+        Premium = true,
+        Text = "Drop Into The Void",
+        Tooltip = "If finishing an enemy doesn't take, drops it under the map instead. That always kills it, but it gives no loot or XP.",
+        Default = false,
+        Callback = function(v) S.void = v == true end
+    })
+
+    local statusLabel = IKBox:AddLabel("Off.", true)
 
     IKBox:SetupDependencies({
         { Toggles.IK_Toggle, true },
     })
 
-    -- network ownership viewer: SelectionBox per mob, green = we own its HumanoidRootPart
+    -- network ownership viewer: SelectionBox per enemy, green = we own its HumanoidRootPart
     local NWO_VIZ_NAME = "NWOViz"
     local NWO_GREEN = Color3.fromRGB(0, 255, 0)
     local NWO_RED   = Color3.fromRGB(255, 0, 0)
-    local NWO_SWEEP_INTERVAL = 0.25  -- 4 Hz; ownership rarely changes frame-to-frame
+    local NWO_SWEEP_INTERVAL = 0.25
 
-    local nwo = { tick = nil, boxes = {}, acc = 0 }
+    local nwo = { tick = nil, boxes = {} }
 
     -- executors disagree on isnetworkowner semantics (boolean vs owning Player); normalize via Executor lookups
     local function iOwn(part)
@@ -18414,10 +18780,10 @@ return function(ctx)
         local isOk, isVal = Executor.call("isnetworkowner", part)
         if isOk then
             if isVal == true then return true end
-            if typeof and typeof(isVal) == "Instance" and isVal == localPlr then return true end
+            if typeof and typeof(isVal) == "Instance" and localPlr and isVal.Name == localPlr.Name then return true end
         end
         local getOk, getVal = Executor.call("getnetworkowner", part)
-        if getOk and getVal == localPlr then return true end
+        if getOk and typeof(getVal) == "Instance" and localPlr and getVal.Name == localPlr.Name then return true end
         return false
     end
 
@@ -18453,24 +18819,17 @@ return function(ctx)
     end
 
     local function nwoSweep()
-        local myChar = References.character
         local seen = {}
-        -- prefer workspace.Live when present — avoids a full-workspace GetDescendants
-        local live = Services.Workspace:FindFirstChild("Live")
-        local scan = live and live:GetChildren() or Services.Workspace:GetDescendants()
-        for _, obj in ipairs(scan) do
-            if obj:IsA("Model") and obj ~= myChar then
-                local h = obj:FindFirstChildOfClass("Humanoid")
-                if h and not Services.Players:GetPlayerFromCharacter(obj) then
-                    local hrp = obj:FindFirstChild("HumanoidRootPart")
-                    if hrp then
-                        seen[obj] = true
-                        getBox(obj).Color3 = iOwn(hrp) and NWO_GREEN or NWO_RED
-                    end
+        local folder = Services.Workspace:FindFirstChild(ENEMIES)
+        for _, obj in ipairs(folder and folder:GetChildren() or {}) do
+            if obj:IsA("Model") and not isPlayerModel(obj) then
+                local hrp = obj:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    seen[obj] = true
+                    getBox(obj).Color3 = iOwn(hrp) and NWO_GREEN or NWO_RED
                 end
             end
         end
-        -- drop boxes for models we didn't see (left workspace, lost humanoid, etc.)
         for model in pairs(nwo.boxes) do
             if not seen[model] then clearBox(model) end
         end
@@ -18479,8 +18838,8 @@ return function(ctx)
     local function nwoClearAll()
         for model in pairs(nwo.boxes) do clearBox(model) end
         nwo.boxes = {}
-        -- deep sweep for stray boxes we lost track of
-        for _, obj in ipairs(Services.Workspace:GetDescendants()) do
+        local folder = Services.Workspace:FindFirstChild(ENEMIES)
+        for _, obj in ipairs(folder and folder:GetDescendants() or {}) do
             if obj.Name == NWO_VIZ_NAME and obj:IsA("SelectionBox") then
                 pcall(function() obj:Destroy() end)
             end
@@ -18494,7 +18853,6 @@ return function(ctx)
             if Toggles.IK_NWOViz then Toggles.IK_NWOViz:SetValue(false) end
             return
         end
-        nwo.acc = 0
         nwo.tick = track(Scheduler.heartbeat(function()
             pcall(nwoSweep)
         end, { name = "NetOwnerViz", priority = 200, interval = NWO_SWEEP_INTERVAL, deferrable = true }))
@@ -18508,17 +18866,31 @@ return function(ctx)
     InstakillGroupbox:AddToggle("IK_NWOViz", {
         Premium = true,
         Text = "Network Ownership Viewer",
-        Tooltip = "Outlines entities — green: you own it, red: you don't. Useful for diagnosing why kills do or don't replicate.",
+        Tooltip = "Outlines enemies: green means your game is moving it (Instakill can finish it), red means the server is.",
         Default = false,
         Callback = function(v)
             if v then nwoStart() else nwoStop() end
         end
     })
 
+    local function statusLine()
+        if not S.on then return "Off." end
+        if not isOwnerFn then return "Your executor can't tell when an enemy is yours, so Instakill can't work here." end
+        local count = #S.watched
+        local lines = { count == 1 and "Watching 1 enemy in range." or ("Watching %d enemies in range."):format(count) }
+        lines[#lines + 1] = ("Chances so far: %d. Kills: %d."):format(S.chances, S.kills)
+        if S.voided > 0 then lines[#lines + 1] = ("Dropped into the void: %d"):format(S.voided) end
+        return table.concat(lines, "\n")
+    end
+
+    track(Scheduler.heartbeat(function()
+        if Library and not Library.Toggled then return end
+        Ui.text(statusLabel, statusLine())
+    end, { name = "Instakill.refresh", interval = REFRESH_EVERY, deferrable = true }))
+
     O.onUnload(function()
         stopIK()
         nwoStop()
-        restoreSimRadius()
     end)
     O.finalize()
 
@@ -20049,6 +20421,10 @@ local LOADERS = {
     -- what you carry and selling it; loot bags and picking them up, which fires prompts through Interact
     { name = "Inventory", load = function() return require("Api/Inventory") end },
     { name = "Loot",    load = function() return require("Api/Loot") end },
+    -- the shops round the world and buying from them, which fires prompts through Interact
+    { name = "Shop",    load = function() return require("Api/Shop") end },
+    -- your body stats and spending the points for them, through CloverNet
+    { name = "Stats",   load = function() return require("Api/Stats") end },
     -- after State, whose death signal it times the respawn screen from
     { name = "Respawn", load = function() return require("Api/Respawn") end },
     -- races are flown by features through Movement; the api only talks to the race server
@@ -24837,6 +25213,12 @@ local COALESCE = 0.25
 local CONFIRM  = 0.6
 -- a refused parry falls back to a block held this long past the strike
 local BLOCK_HOLD = 0.3
+-- a parry press costs this long a cooldown (live 2026-10-24), timed off our own last press and the server's StateEnd stamp; a strike due this soon after it ends is still blocked rather than parried
+local PARRY_COOLDOWN = 1
+local PARRY_COOLDOWN_END = "StateEnd_ParryCooldown"
+local COOLDOWN_SLACK = 0.1
+-- a special is rolled through rather than parried when the asker wants that (the user, 2026-10-24: a Dire Wolf's HyperArmor specials landed every hit on a level 30), the roll going out this far ahead of the strike so its i-frames are on when it lands
+local ROLL_LEAD = 0.15
 -- an attack with nothing learned is blocked this soon after its tell (pressing block opens a 0.25 s parry window first, live 2026-10-24) and held until it lands, or this long at most
 local GUARD_REACT = 0.08
 local GUARD_LIMIT = 2.6
@@ -24875,6 +25257,8 @@ function M.new(ctx)
     local hooks = {}
     local running = false
     local blockUntil = nil
+    -- when our last parry press went out
+    local sinceParry = nil
     local lastPress = -math.huge
     local health = { humanoid = nil, conn = nil, last = nil, char = nil, struckConn = nil }
     local parrySignal = base.signal()
@@ -25011,8 +25395,9 @@ function M.new(ctx)
         return range
     end
 
-    -- the request that covers a mob this far away, if any; the first that does decides roll and block
+    -- the asks that cover a mob this far off, merged: a fallback any of them wants is used (one asker rolling through specials is enough for the farm and the parry box both on)
     local function coverFor(model, gap)
+        local merged = nil
         for _, request in pairs(requests) do
             if gap <= request.range then
                 local fits = true
@@ -25020,10 +25405,18 @@ function M.new(ctx)
                     local ok, answer = pcall(request.filter, model)
                     fits = ok and answer == true
                 end
-                if fits then return request end
+                if fits then
+                    if not merged then
+                        merged = { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge }
+                    else
+                        merged.roll = merged.roll or request.roll
+                        merged.block = merged.block or request.block
+                        merged.dodge = merged.dodge or request.dodge
+                    end
+                end
             end
         end
-        return nil
+        return merged
     end
 
     local function ping()
@@ -25181,6 +25574,20 @@ function M.new(ctx)
 
     -- ===== the press =====
 
+    -- seconds until our own parry cooldown is over by the server's clock, 0 when it is: the client hears of a fresh one late, so a press straight after a parry can go out and be refused (live 2026-10-24: Holda's 0.3-0.5 s attacks inside the 1 s cooldown landed hit after hit)
+    local function parryCooling()
+        local char = character()
+        local State = apiOf("State")
+        if not (char and State and type(State.serverTime) == "function") then return 0 end
+        local okNow, serverNow = State.serverTime()
+        local okEnds, ends = pcall(function() return char:GetAttribute(PARRY_COOLDOWN_END) end)
+        if not okEnds then return 0 end
+        if not (okNow and finite(serverNow) and finite(ends)) then return 0 end
+        local left = ends - serverNow
+        if left > 0 then return left end
+        return 0
+    end
+
     local function press(threat, now, due)
         local Combat = apiOf("Combat")
         if not Combat then return end
@@ -25188,7 +25595,18 @@ function M.new(ctx)
         -- one press covers every strike due inside its window
         if now - lastPress <= COALESCE then return end
         lastPress = now
+        -- still cooling when it lands: no parry would be taken, so the block is held across the strike instead
+        if sinceParry and now - sinceParry < PARRY_COOLDOWN or parryCooling() > due - now - COOLDOWN_SLACK then
+            local request = threat.request
+            if request.block and Combat.block(true) == true then
+                stats.blocked = stats.blocked + 1
+                threat.guarded = true
+                blockUntil = math.max(blockUntil or 0, due + BLOCK_HOLD)
+                return
+            end
+        end
         if Combat.parry({ window = PRESS_HOLD }) == true then
+            sinceParry = now
             stats.pressed = stats.pressed + 1
             return
         end
@@ -25200,6 +25618,29 @@ function M.new(ctx)
         end
         if request.block and Combat.block(true) == true then
             stats.blocked = stats.blocked + 1
+            blockUntil = math.max(blockUntil or 0, due + BLOCK_HOLD)
+        end
+    end
+
+    -- a special rolled through: the roll's i-frames timed onto the strike (learned, or the default guess for one never seen), a parry or a block when the roll is refused
+    local function dodge(threat, now, due)
+        local Combat = apiOf("Combat")
+        if not Combat then return end
+        threat.pressed = now
+        if Combat.roll() == true then
+            stats.rolled = stats.rolled + 1
+            threat.dodged = true
+            return
+        end
+        if known(threat) then
+            threat.pressed = nil
+            threat.noDodge = true
+            return
+        end
+        local request = threat.request
+        if request.block and Combat.block(true) == true then
+            stats.blocked = stats.blocked + 1
+            threat.guarded = true
             blockUntil = math.max(blockUntil or 0, due + BLOCK_HOLD)
         end
     end
@@ -25245,7 +25686,11 @@ function M.new(ctx)
                 threat.outcome = threat.guarded and "guarded" or "blocked"
                 if threat.guarded then stats.guarded = stats.guarded + 1 end
             elseif not threat.pressed then
-                if known(threat) then
+                if threat.kind == "SkillActive" and threat.request.dodge and not threat.noDodge then
+                    local delay = timingOf(threat)
+                    local due = threat.tell + delay
+                    if now >= due - lag - ROLL_LEAD - offset then dodge(threat, now, due) end
+                elseif known(threat) then
                     local delay, spread = timingOf(threat)
                     local due = threat.tell + delay
                     if now >= due - spread - lag - LEAD - offset then press(threat, now, due) end
@@ -25299,7 +25744,7 @@ function M.new(ctx)
     local function readRequest(name, opts, into)
         if opts ~= nil and type(opts) ~= "table" then return nil end
         opts = opts or {}
-        local request = into or { name = name, range = 30, roll = true, block = true }
+        local request = into or { name = name, range = 30, roll = true, block = true, dodge = false }
         if opts.range ~= nil then
             if not (finite(opts.range) and opts.range > 0) then return nil end
             request.range = opts.range
@@ -25312,6 +25757,10 @@ function M.new(ctx)
             if type(opts.block) ~= "boolean" then return nil end
             request.block = opts.block
         end
+        if opts.dodge ~= nil then
+            if type(opts.dodge) ~= "boolean" then return nil end
+            request.dodge = opts.dodge
+        end
         if opts.filter ~= nil then
             if type(opts.filter) ~= "function" then return nil end
             request.filter = opts.filter
@@ -25319,7 +25768,7 @@ function M.new(ctx)
         return request
     end
 
-    -- name says who asked; range in studs (30), roll and block as the fallbacks to a refused parry (both on), filter(model) to narrow which mobs
+    -- name says who asked; range in studs (30), roll and block as the fallbacks to a refused parry (both on), dodge to roll through specials instead of parrying them (off), filter(model) to narrow which mobs
     expose("request", function(name, opts)
         if type(name) ~= "string" or name == "" then return false, Errors.BAD_ARGS end
         local request = readRequest(name, opts)
@@ -25334,7 +25783,7 @@ function M.new(ctx)
     expose("adjust", function(token, opts)
         local request = requests[token]
         if not request then return false, Errors.NO_TOKEN end
-        if not readRequest(request.name, opts, { name = request.name, range = request.range, roll = request.roll, block = request.block, filter = request.filter }) then
+        if not readRequest(request.name, opts, { name = request.name, range = request.range, roll = request.roll, block = request.block, dodge = request.dodge, filter = request.filter }) then
             return false, Errors.BAD_ARGS
         end
         readRequest(request.name, opts, request)
@@ -25472,6 +25921,8 @@ local KNOWN_STARTS = {
 local STORE_KEY = "courses"
 -- InRace lags the race's end and start by a moment either way
 local SETTLE = 3
+-- how much the latest race moves a course's running averages
+local RATE_WEIGHT = 0.3
 
 local M = {}
 
@@ -25546,6 +25997,67 @@ function M.new(ctx)
         eventSignal:Fire(kind, info)
     end
 
+    -- a gate disc's thin axis is its crossing direction
+    local function thinAxis(part)
+        local size, cf = part.Size, part.CFrame
+        if size.X <= size.Y and size.X <= size.Z then return cf.RightVector end
+        if size.Y <= size.Z then return cf.UpVector end
+        return cf.LookVector
+    end
+
+    local function packRoute(points)
+        local out = {}
+        for i, p in ipairs(points) do
+            local orbs = {}
+            for j, orb in ipairs(p.orbs) do orbs[j] = { orb.X, orb.Y, orb.Z } end
+            out[i] = { p.position.X, p.position.Y, p.position.Z, p.normal.X, p.normal.Y, p.normal.Z, orbs = orbs }
+        end
+        return out
+    end
+
+    local function unpackRoute(saved)
+        if type(saved) ~= "table" or #saved == 0 then return nil end
+        local out = {}
+        for i, p in ipairs(saved) do
+            if type(p) ~= "table" then return nil end
+            for k = 1, 6 do
+                if not finite(p[k]) then return nil end
+            end
+            local orbs = {}
+            for _, orb in ipairs(type(p.orbs) == "table" and p.orbs or {}) do
+                if type(orb) == "table" and finite(orb[1]) and finite(orb[2]) and finite(orb[3]) then orbs[#orbs + 1] = Vector3.new(orb[1], orb[2], orb[3]) end
+            end
+            out[i] = { position = Vector3.new(p[1], p[2], p[3]), normal = Vector3.new(p[4], p[5], p[6]), orbs = orbs, finish = i == #saved }
+        end
+        return out
+    end
+
+    -- workspace.Map["@BroomRacing"][course].PointN (live 2026-10-24): each a Gate model whose TouchPart is the disc, and the SpeedOrbs on the way to it; nil while any of it is streamed out
+    local function readMap(course)
+        local root = folder()
+        local f = root and root:FindFirstChild(course)
+        if not f then return nil end
+        local list = {}
+        for _, child in ipairs(f:GetChildren()) do
+            local n = tonumber(string.match(child.Name, "^Point(%d+)$"))
+            if n then list[#list + 1] = { n = n, folder = child } end
+        end
+        if #list == 0 then return nil end
+        table.sort(list, function(a, b) return a.n < b.n end)
+        local out = {}
+        for i, entry in ipairs(list) do
+            local gate = entry.folder:FindFirstChild("Gate")
+            local touch = gate and gate:FindFirstChild("TouchPart")
+            if not (touch and touch:IsA("BasePart")) then return nil end
+            local orbs = {}
+            for _, c in ipairs(entry.folder:GetChildren()) do
+                if c.Name == "SpeedOrb" and c:IsA("BasePart") then orbs[#orbs + 1] = c.Position end
+            end
+            out[i] = { position = touch.Position, normal = thinAxis(touch), orbs = orbs, finish = i == #list }
+        end
+        return out
+    end
+
     local function gateEntry(cf, finish)
         race.shown = (race.shown or 0) + 1
         -- the disc's thin axis is its X, so a gate is crossed along its RightVector, either way
@@ -25607,9 +26119,18 @@ function M.new(ctx)
 
     local function onCreate(list, id)
         if type(list) ~= "table" then return end
+        -- a gate arrives with the orbs on the way to it, so the orbs are gathered first and filed under it
+        local orbs = {}
+        for _, item in pairs(list) do
+            if type(item) == "table" and typeof(item.Orb) == "CFrame" then orbs[#orbs + 1] = item.Orb.Position end
+        end
         for _, item in pairs(list) do
             if type(item) == "table" then
                 for key, cf in pairs(item) do
+                    if typeof(cf) == "CFrame" and (key == "Gate" or key == "FinishGate") then
+                        race.flown = race.flown or {}
+                        race.flown[#race.flown + 1] = { position = cf.Position, normal = cf.RightVector, orbs = orbs, finish = key == "FinishGate" }
+                    end
                     if typeof(cf) == "CFrame" then
                         if key == "START" then
                             race.start, race.id = cf.Position, id
@@ -25662,6 +26183,12 @@ function M.new(ctx)
                 local e = entry(course)
                 if not finite(e.best) or time < e.best then
                     e.best = time
+                    save()
+                end
+                -- the whole course, flown gate by gate to its finish, for the next time it's raced
+                local flown = race.flown
+                if flown and #flown > 0 and flown[#flown].finish and not unpackRoute(e.route) then
+                    e.route = packRoute(flown)
                     save()
                 end
             end
@@ -25766,6 +26293,44 @@ function M.new(ctx)
         local point = startOf(course)
         if not point then return false, Errors.NO_COURSE end
         return true, point
+    end)
+
+    -- (true, { start, points }) the whole course, every gate in order ({ position, normal, orbs, finish }), read off the map while it's streamed in, else the last one flown to its finish; (false, NO_COURSE) before either
+    expose("route", function(course)
+        if type(course) ~= "string" then return false, Errors.BAD_ARGS end
+        local e = courses[course]
+        local points = readMap(course)
+        if points then
+            if not unpackRoute(type(e) == "table" and e.route or nil) then
+                entry(course).route = packRoute(points)
+                save()
+            end
+        else
+            points = unpackRoute(type(e) == "table" and e.route or nil)
+        end
+        if not points then return false, Errors.NO_COURSE end
+        return true, { start = startOf(course), points = points }
+    end)
+
+    -- what a course pays: xp a race and seconds from one finish to the next when it's raced again and again, each kept as a running average
+    expose("note", function(course, xp, cycle)
+        if type(course) ~= "string" or not finite(xp) or xp < 0 then return false, Errors.BAD_ARGS end
+        local e = entry(course)
+        e.xp = finite(e.xp) and e.xp + (xp - e.xp) * RATE_WEIGHT or xp
+        if finite(cycle) and cycle > 0 then e.cycle = finite(e.cycle) and e.cycle + (cycle - e.cycle) * RATE_WEIGHT or cycle end
+        save()
+        return true
+    end)
+
+    -- (true, { [course] = { xp, cycle, rate } }) for every course raced so far; rate is xp a second, nil until a repeat has been timed
+    expose("rates", function()
+        local out = {}
+        for course, e in pairs(courses) do
+            if type(e) == "table" and finite(e.xp) then
+                out[course] = { xp = e.xp, cycle = finite(e.cycle) and e.cycle or nil, rate = finite(e.cycle) and e.cycle > 0 and e.xp / e.cycle or nil }
+            end
+        end
+        return true, out
     end)
 
     expose("best", function(course)
@@ -26077,6 +26642,541 @@ return {
     TOO_SOON  = "respawn/too_soon",
     NO_SHRINE = "respawn/no_shrine",
     FAILED    = "respawn/failed",
+}
+
+end)
+__bundle_register("Api/Stats", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- stats api: your six body stats (Player.Skills.<name>.Level, capped at BodyInfo's MaxUpgrades of 50) and the points to spend on them (PlayerFolder StatPoints, two a level), spent one at a time through Remotes.Player.SkillEvent the way the stats page's + button does (StatClient.lua:39-51, 85-92, 247-251); and the traits your skill points buy, read off the game's Skills data with what each still needs (TraitClient.lua:130-186) and learned the way the trait page does (TraitClient.lua:395-404); both work from anywhere (live 2026-10-24); shared as ctx.Api.Stats
+local References = require("References")
+local Services   = require("Services")
+local Api        = require("Api")
+local Errors     = require("Api/Stats/Errors")
+
+local SKILL_EVENT = "Player/SkillEvent"
+local NAMES = { "Vitality", "Endurance", "Strength", "Agility", "Intelligence", "Magic Power" }
+-- how a trait requirement that isn't a body stat reads to a player
+local REQUIREMENT_WORDS = {
+    Level           = "level %d",
+    NPCKills        = "%d monster kills",
+    PlayerKills     = "%d player kills",
+    AirDashUnlocked = "air dash unlocked",
+}
+local MAX = 50
+local ANSWER_WAIT = 6
+-- the new level replicates a moment after the answer
+local SETTLE = 2
+local POLL = 0.1
+
+local M = {}
+
+local KNOWN = {}
+for _, name in ipairs(NAMES) do KNOWN[name] = true end
+
+-- the stat to spend the next point on: the one furthest below its goal as a share of it, ties going to the earlier in order; nil when every goal is met
+function M.pick(levels, goals, order, max, skip)
+    max = max or MAX
+    local best, bestShare = nil, math.huge
+    for _, name in ipairs(order or NAMES) do
+        local goal = math.min(tonumber(goals[name]) or 0, max)
+        local level = tonumber(levels[name]) or 0
+        if goal > 0 and level < goal and not (skip and skip[name]) then
+            local share = level / goal
+            if share < bestShare - 1e-9 then best, bestShare = name, share end
+        end
+    end
+    return best
+end
+
+-- the trait to learn next from a priority list of names: the first one not owned whose requirements are met, as long as you have the points for it (so a better trait is saved up for rather than spent past); nil and the one being saved for otherwise
+function M.pickTrait(list, priority, points)
+    local byName = {}
+    for _, entry in ipairs(list) do byName[entry.name] = entry end
+    for _, name in ipairs(priority) do
+        local entry = byName[name]
+        if entry and not entry.owned and entry.ready then
+            if (tonumber(points) or 0) >= entry.points then return entry, nil end
+            return nil, entry
+        end
+    end
+    return nil, nil
+end
+
+M.NAMES, M.MAX = NAMES, MAX
+
+function M.new(ctx)
+    local base = Api.define("Stats", ctx)
+    local api = { Errors = Errors, NAMES = NAMES, MAX = MAX, pick = M.pick, pickTrait = M.pickTrait }
+    local closed = false
+    local spending = false
+
+    local function apiOf(name)
+        local found = ctx.Api and ctx.Api[name]
+        if type(found) == "table" then return found end
+        return nil
+    end
+
+    local function settle(label, ok, ...)
+        if ok then return ... end
+        base.warn("%s threw: %s", label, tostring((...)))
+        return false, Errors.NOT_READY
+    end
+
+    local function expose(name, fn)
+        local label = "Stats." .. name
+        api[name] = function(...)
+            if closed then return false, Errors.NOT_READY end
+            return settle(label, pcall(fn, ...))
+        end
+    end
+
+    local function levelOf(skills, name)
+        local stat = skills:FindFirstChild(name)
+        local level = stat and stat:FindFirstChild("Level")
+        if level and level:IsA("ValueBase") and type(level.Value) == "number" then return level.Value end
+        return nil
+    end
+
+    local function snapshot()
+        local player = References.player
+        local skills = player and player:FindFirstChild("Skills")
+        local folder = player and player:FindFirstChild("PlayerFolder")
+        if not (skills and folder) then return nil end
+        local levels = {}
+        for _, name in ipairs(NAMES) do
+            local level = levelOf(skills, name)
+            if level == nil then return nil end
+            levels[name] = level
+        end
+        local magic = folder:GetAttribute("Magic")
+        return {
+            levels      = levels,
+            points      = tonumber(folder:GetAttribute("StatPoints")) or 0,
+            skillPoints = tonumber(folder:GetAttribute("SkillPoints")) or 0,
+            level       = tonumber(folder:GetAttribute("Level")) or 0,
+            -- StatClient.lua:129-131: "None" is a magic not unlocked yet, which the stats page hides Magic Power for
+            magic       = (type(magic) == "string" and magic ~= "" and magic ~= "None") and magic or nil,
+            max         = MAX,
+        }, skills
+    end
+
+    -- (true, { levels = { [name] = level }, points, skillPoints, level, magic (nil before one is unlocked), max })
+    expose("read", function()
+        local view = snapshot()
+        if not view then return false, Errors.NOT_READY end
+        return true, view
+    end)
+
+    local function spendOne(net, skills, name, before)
+        local ok, answer = net.callWith(SKILL_EVENT, { timeout = ANSWER_WAIT }, "Unlock", name)
+        if not ok then return false, Errors.NO_ANSWER, answer end
+        local limit = os.clock() + SETTLE
+        local now = levelOf(skills, name) or before
+        while now <= before and os.clock() < limit do
+            task.wait(POLL)
+            now = levelOf(skills, name) or before
+        end
+        if now > before then return true, now end
+        if not answer then return false, Errors.REFUSED end
+        return false, Errors.NO_ANSWER, "the level did not change"
+    end
+
+    -- spends one point on a stat: (true, its new level); yields
+    expose("spend", function(name)
+        if not KNOWN[name] then return false, Errors.BAD_ARGS end
+        if not coroutine.isyieldable() then return false, Errors.BAD_ARGS end
+        if spending then return false, Errors.NOT_READY end
+        local net = apiOf("CloverNet")
+        local view, skills = snapshot()
+        if not (net and view) then return false, Errors.NOT_READY end
+        if view.points <= 0 then return false, Errors.NO_POINTS end
+        local before = view.levels[name]
+        if before >= MAX then return false, Errors.MAXED end
+        spending = true
+        local ok, a, b, c = pcall(spendOne, net, skills, name, before)
+        spending = false
+        if not ok then
+            base.warn("spending on %s threw: %s", name, tostring(a))
+            return false, Errors.NOT_READY
+        end
+        return a, b, c
+    end)
+
+    -- ReplicatedStorage.Modules.Skills is pure data (BodyInfo, TraitInfo and the rest merged into .Skills); kept once loaded, never while missing
+    local catalog, lastLoadError = nil, nil
+    local function skillDefs()
+        if catalog then return catalog end
+        local modules = Services.ReplicatedStorage:FindFirstChild("Modules")
+        local instance = modules and modules:FindFirstChild("Skills")
+        if not instance then return nil end
+        local ok, value = pcall(require, instance)
+        if not ok or type(value) ~= "table" or type(value.Skills) ~= "table" then
+            if tostring(value) ~= lastLoadError then
+                lastLoadError = tostring(value)
+                base.warn("the Skills module did not load: %s", lastLoadError)
+            end
+            return nil
+        end
+        catalog = value.Skills
+        return catalog
+    end
+
+    -- TraitClient.lua:130-186: a stat requirement is read off PlayerFolder first (Level, NPCKills), else as a skill's level; a quest one is that Quests entry marked Completed
+    local function requirementsOf(def, player, skills, folder)
+        local required = type(def.Required) == "table" and def.Required or {}
+        local missing = {}
+        if type(required.Stat) == "table" then
+            for stat, need in pairs(required.Stat) do
+                local have = folder:GetAttribute(stat)
+                if type(have) ~= "number" then have = levelOf(skills, stat) or 0 end
+                if have < need then
+                    local words = REQUIREMENT_WORDS[stat]
+                    missing[#missing + 1] = words and words:format(need) or ("%s %d"):format(stat, need)
+                end
+            end
+        end
+        if type(required.Quest) == "string" then
+            local quests = player:FindFirstChild("Quests")
+            local quest = quests and quests:FindFirstChild(required.Quest)
+            if not (quest and quest:GetAttribute("Completed")) then missing[#missing + 1] = ("the quest from %s"):format(required.Quest) end
+        end
+        -- the trait page doesn't check these, but they are what the trait builds on
+        if type(required.Prereq) == "table" then
+            for name in pairs(required.Prereq) do
+                if not skills:FindFirstChild(name) then missing[#missing + 1] = name .. " first" end
+            end
+        end
+        local marks = tonumber(required.Marks) or 0
+        if marks > 0 and (tonumber(folder:GetAttribute("Marks")) or 0) < marks then missing[#missing + 1] = ("%d Marks"):format(marks) end
+        table.sort(missing)
+        return missing, tonumber(required.Points) or 0, marks
+    end
+
+    -- (true, list) every trait the game has: { name, class, description, points, marks, owned, ready (every requirement met), missing (what isn't, in plain words) }
+    expose("traits", function()
+        local defs = skillDefs()
+        local player = References.player
+        local skills = player and player:FindFirstChild("Skills")
+        local folder = player and player:FindFirstChild("PlayerFolder")
+        if not (defs and skills and folder) then return false, Errors.NOT_READY end
+        local out = {}
+        for name, def in pairs(defs) do
+            if type(name) == "string" and type(def) == "table" and def.Type == "Trait" then
+                local missing, points, marks = requirementsOf(def, player, skills, folder)
+                out[#out + 1] = {
+                    name        = name,
+                    class       = def.Class,
+                    description = type(def.Description) == "string" and def.Description or "",
+                    points      = points,
+                    marks       = marks,
+                    owned       = skills:FindFirstChild(name) ~= nil,
+                    ready       = #missing == 0,
+                    missing     = missing,
+                }
+            end
+        end
+        table.sort(out, function(a, b) return a.name < b.name end)
+        return true, out
+    end)
+
+    local function learnOne(net, skills, name)
+        local ok, answer = net.callWith(SKILL_EVENT, { timeout = ANSWER_WAIT }, "UnlockTrainer", name)
+        if not ok then return false, Errors.NO_ANSWER, answer end
+        local limit = os.clock() + SETTLE
+        while not skills:FindFirstChild(name) and os.clock() < limit do task.wait(POLL) end
+        if skills:FindFirstChild(name) then return true end
+        if not answer then return false, Errors.REFUSED end
+        return false, Errors.NO_ANSWER, "the trait did not appear"
+    end
+
+    -- learns a trait with skill points the way the trait page's learn button does, no trainer needed (live 2026-10-24); (true) once it is yours; yields
+    expose("learn", function(name)
+        if type(name) ~= "string" or name == "" then return false, Errors.BAD_ARGS end
+        if not coroutine.isyieldable() then return false, Errors.BAD_ARGS end
+        if spending then return false, Errors.NOT_READY end
+        local defs = skillDefs()
+        local net = apiOf("CloverNet")
+        local player = References.player
+        local skills = player and player:FindFirstChild("Skills")
+        local folder = player and player:FindFirstChild("PlayerFolder")
+        if not (defs and net and skills and folder) then return false, Errors.NOT_READY end
+        local def = defs[name]
+        if type(def) ~= "table" or def.Type ~= "Trait" then return false, Errors.BAD_ARGS end
+        if skills:FindFirstChild(name) then return true end
+        local missing, points = requirementsOf(def, player, skills, folder)
+        if #missing > 0 then return false, Errors.NOT_MET, missing end
+        if (tonumber(folder:GetAttribute("SkillPoints")) or 0) < points then return false, Errors.NO_POINTS end
+        spending = true
+        local ok, a, b, c = pcall(learnOne, net, skills, name)
+        spending = false
+        if not ok then
+            base.warn("learning %s threw: %s", name, tostring(a))
+            return false, Errors.NOT_READY
+        end
+        return a, b, c
+    end)
+
+    if base.maid then
+        base.maid:GiveTask(function() closed = true end)
+    end
+
+    return api
+end
+
+return M
+
+end)
+__bundle_register("Api/Stats/Errors", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- stats errors: the string codes every stats verb returns as its failure result
+
+return {
+    NOT_READY = "stats/not_ready",
+    BAD_ARGS  = "stats/bad_args",
+    NO_POINTS = "stats/no_points",
+    MAXED     = "stats/maxed",
+    NOT_MET   = "stats/not_met",
+    NO_ANSWER = "stats/no_answer",
+    REFUSED   = "stats/refused",
+}
+
+end)
+__bundle_register("Api/Shop", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- shop api: the things for sale in the world, each a model with a BuyPrompt and a Price in Marks (live 2026-10-24: the Kamo shop's Wood, Stone Pickaxe, Dull Rapier and the rest), remembered where they were seen since they stream out, and bought the way the shop window does: the prompt fired, the server naming the model and its price on ShopEvent.Client, then ShopEvent "Buy" with a count of 1 to 15 from within 10 studs (ShopClient.lua:32-112); shared as ctx.Api.Shop
+local References = require("References")
+local Services   = require("Services")
+local Store      = require("Utility/Store")
+local Api        = require("Api")
+local Errors     = require("Api/Shop/Errors")
+
+local SHOP, OFFER = "Player/ShopEvent", "Player/ShopEvent/Client"
+local PROMPT = "BuyPrompt"
+-- ShopClient.lua:105-110 closes the window past 10 studs; Basic.MaxBuy
+local REACH = 10
+local MAX_BUY = 15
+local OFFER_WAIT = 3
+local ANSWER_WAIT = 6
+local SETTLE = 2
+local POLL = 0.1
+-- listings seen this close together are the same one
+local SAME = 6
+local STORE_KEY = "listings"
+-- shops round the character are looked for at most this often, this far round
+local LEARN_EVERY = 10
+local LEARN_RADIUS = 150
+-- seen live 2026-10-24 in Kamo, before anything is learned
+local KNOWN = {
+    ["Wood"]              = { { -496, 46, 1969, 5 } },
+    ["Cloth"]             = { { -269, 85, 1979, 10 } },
+    ["Stone Pickaxe"]     = { { -449, 47, 1968, 25 } },
+    ["Stone Sickle"]      = { { -444, 47, 1967, 25 } },
+    ["Dull Rapier"]       = { { -462, 45, 1948, 30 } },
+    ["Vagabond's Attire"] = { { -500, 43, 1813, 100 } },
+    ["Highland Uniform"]  = { { -498, 43, 1794, 100 } },
+}
+
+local M = {}
+
+local function finite(n)
+    return type(n) == "number" and n == n and n > -math.huge and n < math.huge
+end
+
+function M.new(ctx)
+    local base = Api.define("Shop", ctx)
+    local api = { Errors = Errors, REACH = REACH, MAX_BUY = MAX_BUY }
+    local namespace = Store.GAME .. "/shop"
+    local closed = false
+    local hook = nil
+    local offer = nil
+    local busy = false
+
+    local saved = Store.read(namespace, STORE_KEY, {})
+    if type(saved) ~= "table" then saved = {} end
+    local listings = saved
+    for item, list in pairs(KNOWN) do
+        if type(listings[item]) ~= "table" then listings[item] = list end
+    end
+
+    local function apiOf(name)
+        local found = ctx.Api and ctx.Api[name]
+        if type(found) == "table" then return found end
+        return nil
+    end
+
+    local function settle(label, ok, ...)
+        if ok then return ... end
+        base.warn("%s threw: %s", label, tostring((...)))
+        return false, Errors.NOT_READY
+    end
+
+    local function expose(name, fn)
+        local label = "Shop." .. name
+        api[name] = function(...)
+            if closed then return false, Errors.NOT_READY end
+            return settle(label, pcall(fn, ...))
+        end
+    end
+
+    local function onOffer(model, price)
+        if typeof(model) == "Instance" then offer = { model = model, price = finite(price) and price or nil, at = os.clock() } end
+    end
+
+    local function ensure()
+        if hook then return true end
+        local net = apiOf("CloverNet")
+        if not net then return false end
+        local ok, handle = net.on(OFFER, onOffer)
+        if not ok or not handle then return false end
+        hook = handle
+        if base.maid then base.maid:GiveTask(handle) end
+        return true
+    end
+
+    local function priceOf(prompt)
+        local value = prompt:FindFirstChild("Price")
+        if value and value:IsA("ValueBase") and finite(value.Value) then return value.Value end
+        return nil
+    end
+
+    local function modelOf(prompt)
+        return prompt:FindFirstAncestorOfClass("Model")
+    end
+
+    local function positionOf(model, prompt)
+        local ok, at = pcall(function() return model:GetPivot().Position end)
+        if ok then return at end
+        local parent = prompt.Parent
+        if parent and parent:IsA("BasePart") then return parent.Position end
+        return nil
+    end
+
+    -- the listings streamed in round a point, each remembered for when it isn't
+    local function scan(around, radius)
+        local out, seenModels = {}, {}
+        local changed = false
+        local okParts, parts = pcall(function() return Services.Workspace:GetPartBoundsInRadius(around, radius) end)
+        if not okParts then return out end
+        for _, part in ipairs(parts) do
+            -- the prompt sits on a part of the listing or at its model's root; nothing wider is searched
+            local prompt = part:FindFirstChild(PROMPT) or (part.Parent and part.Parent:FindFirstChild(PROMPT))
+            local model = prompt and modelOf(prompt)
+            if model and seenModels[model] then prompt = nil end
+            if model then seenModels[model] = true end
+            if prompt and model and prompt:IsA("ProximityPrompt") then
+                local at = positionOf(model, prompt)
+                if at then
+                    local entry = { item = model.Name, model = model, prompt = prompt, position = at, price = priceOf(prompt) }
+                    out[#out + 1] = entry
+                    local known = listings[entry.item]
+                    if type(known) ~= "table" then
+                        known = {}
+                        listings[entry.item] = known
+                    end
+                    local seen = false
+                    for _, spot in ipairs(known) do
+                        if type(spot) == "table" and finite(spot[1]) and (Vector3.new(spot[1], spot[2], spot[3]) - at).Magnitude <= SAME then seen = true end
+                    end
+                    if not seen then
+                        known[#known + 1] = { at.X, at.Y, at.Z, entry.price }
+                        changed = true
+                    end
+                end
+            end
+        end
+        if changed then Store.write(namespace, STORE_KEY, listings) end
+        return out
+    end
+
+    -- shops passed on the way are learned now and then, never every call
+    local lastLook = -math.huge
+    local function learn()
+        local root = References.humanoidRootPart
+        if not root or os.clock() - lastLook < LEARN_EVERY then return end
+        lastLook = os.clock()
+        scan(root.Position, LEARN_RADIUS)
+    end
+
+    -- (true, list) where an item is sold, nearest origin first: { position, price }
+    expose("find", function(item, origin)
+        if type(item) ~= "string" or item == "" then return false, Errors.BAD_ARGS end
+        if origin ~= nil and typeof(origin) ~= "Vector3" then return false, Errors.BAD_ARGS end
+        learn()
+        local out = {}
+        for _, spot in ipairs(type(listings[item]) == "table" and listings[item] or {}) do
+            if type(spot) == "table" and finite(spot[1]) and finite(spot[2]) and finite(spot[3]) then
+                out[#out + 1] = { position = Vector3.new(spot[1], spot[2], spot[3]), price = finite(spot[4]) and spot[4] or nil }
+            end
+        end
+        if origin then table.sort(out, function(a, b) return (a.position - origin).Magnitude < (b.position - origin).Magnitude end) end
+        return true, out
+    end)
+
+    -- buys count (1 to 15) of an item the character stands within REACH of: (true, how many arrived); yields
+    expose("buy", function(item, count)
+        if type(item) ~= "string" or item == "" then return false, Errors.BAD_ARGS end
+        count = math.floor(tonumber(count) or 1)
+        if count < 1 or count > MAX_BUY then return false, Errors.BAD_ARGS end
+        if not coroutine.isyieldable() then return false, Errors.BAD_ARGS end
+        if busy then return false, Errors.NOT_READY end
+        local net, Interact = apiOf("CloverNet"), apiOf("Interact")
+        local player = References.player
+        local folder = player and player:FindFirstChild("PlayerFolder")
+        local root = References.humanoidRootPart
+        if not (net and Interact and folder and root and ensure()) then return false, Errors.NOT_READY end
+        local here = root.Position
+        local listing = nil
+        for _, entry in ipairs(scan(here, REACH + 10)) do
+            if entry.item == item and (entry.position - here).Magnitude <= REACH and (not listing or (entry.position - here).Magnitude < (listing.position - here).Magnitude) then listing = entry end
+        end
+        if not listing then return false, Errors.TOO_FAR end
+        local marks = tonumber(folder:GetAttribute("Marks")) or 0
+        if listing.price and marks < listing.price * count then return false, Errors.NO_MARKS end
+        busy = true
+        local ok, a, b = pcall(function()
+            local asked = os.clock()
+            offer = nil
+            local fired, code = Interact.prompt(listing.prompt)
+            if not fired then return false, Errors.REFUSED, code end
+            local limit = os.clock() + OFFER_WAIT
+            while not (offer and offer.at >= asked) and os.clock() < limit do task.wait(POLL) end
+            if not (offer and offer.at >= asked) then return false, Errors.NO_ANSWER end
+            local before = marks
+            local okCall, answer = net.callWith(SHOP, { timeout = ANSWER_WAIT }, "Buy", offer.model, count)
+            if not okCall then return false, Errors.NO_ANSWER, answer end
+            if not answer then return false, Errors.REFUSED end
+            local settleBy = os.clock() + SETTLE
+            while (tonumber(folder:GetAttribute("Marks")) or 0) >= before and os.clock() < settleBy do task.wait(POLL) end
+            return true, count
+        end)
+        busy = false
+        if not ok then
+            base.warn("buying %s threw: %s", item, tostring(a))
+            return false, Errors.NOT_READY
+        end
+        return a, b
+    end)
+
+    ensure()
+
+    if base.maid then
+        base.maid:GiveTask(function() closed = true end)
+    end
+
+    return api
+end
+
+return M
+
+end)
+__bundle_register("Api/Shop/Errors", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- shop errors: the string codes every shop verb returns as its failure result
+
+return {
+    NOT_READY = "shop/not_ready",
+    BAD_ARGS  = "shop/bad_args",
+    NO_SHOP   = "shop/no_shop",
+    TOO_FAR   = "shop/too_far",
+    NO_MARKS  = "shop/no_marks",
+    NO_ANSWER = "shop/no_answer",
+    REFUSED   = "shop/refused",
 }
 
 end)
@@ -26680,6 +27780,17 @@ function M.new(ctx)
         }
     end
 
+    -- what handing it in pays: its Rewards folder's EXP and Marks values (live 2026-10-24: 35-230 XP and 10-50 Marks a repeatable)
+    local function rewardsOf(folder)
+        local rewards = folder:FindFirstChild("Rewards")
+        local function amount(name)
+            local value = rewards and rewards:FindFirstChild(name)
+            if value and value:IsA("ValueBase") and type(value.Value) == "number" then return value.Value end
+            return 0
+        end
+        return { xp = amount("EXP"), marks = amount("Marks") }
+    end
+
     local function tasksOf(folder)
         local out = {}
         local holder = folder:FindFirstChild("Tasks") or folder
@@ -26747,6 +27858,7 @@ function M.new(ctx)
                         position = position(folder:GetAttribute("ReturnPosition")),
                         region   = folder:GetAttribute("Legacy"),
                         tasks    = tasksOf(folder),
+                        rewards  = rewardsOf(folder),
                     }
                 end
             end
@@ -30206,6 +31318,9 @@ return {
     steerRises      = { 0.35, 0.7, 1.5, 4 },
     steerStuck      = 3,
     steerStuckGain  = 5,
+    -- the most a steer's owner may lift its ceiling to, and the fastest it climbs or drops whatever its speed along (159 up a Kamo race climb at 300 was never rewound, 175 once in four)
+    steerCeilingMax = 600,
+    steerClimbMax   = 160,
 
     -- a roofed target is entered from the last open-sky point on the pathfinder's route to it, or one of this many before it
     mouthSpots      = 6,
@@ -30277,6 +31392,13 @@ return {
     -- doors looked over round us, and how far ahead of the rest one that opens onto open sky is put
     doorScan       = 10,
     doorOutBonus   = 10000,
+    -- a roofed spot open at the side is flown into level from the first open-sky porch round it at these reaches, at most porchTries of them tried
+    porchDirections = 24,
+    porchReach      = { 10, 20, 35 },
+    porchTries      = 6,
+    -- leaving a building, how far off its way out is looked for, among this many doors
+    doorExitScan   = 250,
+    doorExitLimit  = 24,
     doorwaySearch  = 12,
     doorStandoff   = 5,
     doorReach      = 2,
@@ -30296,6 +31418,8 @@ return {
     -- an indoor start (anything solid this far over the root) with the goal further than indoorNear heads out under open sky first: standing spots on these rings
     -- with nothing over them, the nearest few planned to, at most escapeTries times a trip (live 2026-10-24: a far trip from an inn room spent 12.6 s planning legs through its shut door)
     roofCheck      = 120,
+    -- a target with anything this far over it is under cover and needs a way in
+    coverCheck     = 800,
     indoorNear     = 60,
     skyRings       = { 8, 14, 22, 32, 45, 60 },
     skyWanted      = 6,
@@ -30303,6 +31427,12 @@ return {
     escapePlans    = 2,
     escapeComputes = 2,
     escapeTries    = 3,
+    -- a roofed goal nothing plans to from here is tried from at most this many open-sky spots round it: level with it, and on the ground over and round it on these rings, read down from this far over the goal to this far under it
+    entryTries      = 6,
+    entryRings      = { 40, 70, 110 },
+    entryDirections = 8,
+    entryProbeUp    = 400,
+    entryProbeDown  = 60,
 
     -- a start the pathfinder will not take: free spots this far round it, one tried per ring, at most twice a trip and never twice in one place
     stepOutRings   = { 2, 3, 4, 5, 6 },
@@ -31054,6 +32184,20 @@ function M.new(deps)
         return Vector3.new(from.X + (goal.X - from.X) * t, from.Y, from.Z + (goal.Z - from.Z) * t)
     end
 
+    -- a roofed spot the line in from here can't reach is flown to from a porch beside it, then glided into level
+    local function throughSide(here, spot)
+        if not probe.covered(spot) then return nil end
+        for _, porch in ipairs(Air.porches(probe, spot, here)) do
+            local points = Air.fly(probe, here, porch, true, airRaise)
+            if interrupted() then return nil end
+            if points then
+                points[#points + 1] = spot
+                return points
+            end
+        end
+        return nil
+    end
+
     -- flying is allowed and only geometry is off limits, so a leg goes through the air whenever it can; nil hands it to pathfinding
     local function airLeg(here)
         if not Tuning.airRoutes then return nil end
@@ -31062,14 +32206,23 @@ function M.new(deps)
             streamOnce(goal)
             if interrupted() then return nil end
             if air then
-                local points = Air.fly(probe, here, goal, true, airRaise)
+                local points = Air.fly(probe, here, goal, true, airRaise) or throughSide(here, goal)
                 if points then return { points = points, goal = goal, air = true }, true end
                 return nil
             end
-            for _, spot in ipairs(Planner.candidates(probe, here, goal, { final = true, reach = reach })) do
+            local spots = Planner.candidates(probe, here, goal, { final = true, reach = reach })
+            for _, spot in ipairs(spots) do
                 local points = Air.fly(probe, here, spot, true, airRaise)
                 if interrupted() then return nil end
                 if points then return { points = points, goal = spot, air = true }, true end
+            end
+            for i = 1, math.min(#spots, 2) do
+                local points = throughSide(here, spots[i])
+                if interrupted() then return nil end
+                if points then
+                    base.log("the target is roofed over; flying in from the side")
+                    return { points = points, goal = spots[i], air = true }, true
+                end
             end
             return nil
         end
@@ -31090,6 +32243,8 @@ function M.new(deps)
         if mouthTried or interrupted() then return nil end
         mouthTried = true
         local spots = Planner.mouth(probe, here, goal)
+        -- nothing plans from here at all: a spot outside that a path leads in from, flown to first
+        if not spots then spots = Planner.entries(probe, goal) end
         if not spots or distance(spots[1], here) <= reach then return nil end
         base.log("the target is under a roof; going to the way in first")
         for _, spot in ipairs(spots) do
@@ -31281,7 +32436,7 @@ function M.new(deps)
         end
         if result == nil and not doorsFirst and canStepOut(here) then result = stepOut(job, here) end
         -- doors only help going out of a building or into one: out in the street they lead into somebody's house (the user, 2026-10-24: a village house door after leaving the inn, sat in its doorway)
-        local indoors = probe.roofed(here) or probe.roofed(goal)
+        local indoors = probe.roofed(here) or (probe.roofed(goal) and flatDistance(here, goal) <= Tuning.doorNearTarget * 2)
         if result == nil and indoors and doorAttempts < Tuning.doorAttempts then
             local checked = 0
             for _, door in ipairs(Doors.find(deps.ctx, here, goal, doorsTried, probe)) do
@@ -31618,6 +32773,16 @@ function M.new(char, height, onFault)
     function probe.floorUnder(position, depth)
         local feet = position.Y - height
         return probe.floor(position.X, position.Z, feet + Tuning.settleUp, Tuning.settleUp + depth)
+    end
+
+    -- anything at all over a point, however high (a den under a hillside, roofed 130-240 studs up, live 2026-10-24): what a target needs a way in to, where roofed is what a start needs a way out of
+    function probe.covered(position)
+        local ok, hit = pcall(Workspace.Raycast, Workspace, position, Vector3.new(0, Tuning.coverCheck, 0), rayParams)
+        if not ok then
+            fault("cover probe", hit)
+            return true
+        end
+        return hit ~= nil
     end
 
     -- something solid over the root: a ceiling, a roof, a ledge
@@ -32010,7 +33175,7 @@ end
 
 -- a goal under a roof (a den, a cave): the standing points on the pathfinder's own route there that last have open sky over them, the way in first and a few before it, since the way in itself can sit under an overhang no flight reaches; nil when the goal is open to the sky or there is no route at all
 function M.mouth(probe, from, goal)
-    if not probe.roofed(goal) then return nil end
+    if not probe.covered(goal) then return nil end
     local waypoints = compute(feet(probe, from), feet(probe, goal))
     if not waypoints then return nil end
     local points = standingPoints(probe, waypoints, true)
@@ -32025,6 +33190,32 @@ function M.mouth(probe, from, goal)
     end
     if #out == 0 then return nil end
     return out
+end
+
+-- open-sky standing spots round a roofed goal, nearest it first, the first one a path leads in to the goal from: where to fly to for a goal nothing plans to from here (live 2026-10-24: Holda inside the Witch House, the trip starting in the lake beside it, where nothing pathfinds from); nil for an open goal or none
+function M.entries(probe, goal)
+    if not probe.covered(goal) then return nil end
+    local spots = M.skySpots(probe, goal)
+    -- and the open ground round and over it, whatever its height (live 2026-10-24: the Dire Wolf's den under the terrain at Y -32, every way in from the hillside 130-240 studs higher)
+    for _, radius in ipairs(Tuning.entryRings) do
+        for i = 0, Tuning.entryDirections - 1 do
+            local a = i / Tuning.entryDirections * 2 * math.pi
+            local x, z = goal.X + math.cos(a) * radius, goal.Z + math.sin(a) * radius
+            local y = probe.floor(x, z, goal.Y + Tuning.entryProbeUp, Tuning.entryProbeUp + Tuning.entryProbeDown)
+            if y then
+                local spot = Vector3.new(x, y + probe.height, z)
+                if not probe.roofed(spot) then spots[#spots + 1] = spot end
+            end
+        end
+    end
+    table.sort(spots, function(a, b) return distance(a, goal) < distance(b, goal) end)
+    local tries = 0
+    for _, spot in ipairs(spots) do
+        if tries >= Tuning.entryTries then break end
+        tries = tries + 1
+        if compute(feet(probe, spot), feet(probe, goal)) then return { spot } end
+    end
+    return nil
 end
 
 -- one leg from where the character is: {points, goal, via} or nil once pathfinding and the ground walk have both failed every candidate
@@ -32149,12 +33340,21 @@ local function query(ctx, origin, radius, limit)
     return out
 end
 
+-- whether the far side of a door, seen from here, is under open sky: a door out of the building rather than into another room
+local function opensOut(probe, door, here)
+    local ox, oz = flatOutward(door.outward)
+    local p = door.position
+    local side = 1
+    if (here.X - p.X) * ox + (here.Z - p.Z) * oz < 0 then side = -1 end
+    return not probe.roofed(Vector3.new(p.X - ox * side * Tuning.doorStandoff, p.Y, p.Z - oz * side * Tuning.doorStandoff))
+end
+
 -- doors near the target and near us, nearest the target first, each once, none already tried and none too far to plan to; with a probe, a door with open sky past it comes first, since it leads out of the building (live 2026-10-24: nine doors within 52 studs of an inn room, the rest of them other rooms)
 function M.find(ctx, here, goal, tried, probe)
     local seen, out = {}, {}
-    local function add(list)
+    local function add(list, only)
         for _, door in ipairs(list) do
-            if not seen[door.key] and not tried[door.key] and flatDistance(here, door.position) <= Tuning.legLengths[1] then
+            if not seen[door.key] and not tried[door.key] and flatDistance(here, door.position) <= Tuning.legLengths[1] and (not only or only(door)) then
                 seen[door.key] = true
                 door.score = flatDistance(door.position, goal)
                 out[#out + 1] = door
@@ -32162,15 +33362,27 @@ function M.find(ctx, here, goal, tried, probe)
         end
     end
     add(query(ctx, goal, Tuning.doorNearTarget))
-    add(query(ctx, here, Tuning.doorNearUs, Tuning.doorScan))
+    -- the doors round us only lead anywhere from inside: out in the street they're somebody's house (live 2026-10-24: a trip to a death bag under an overhang 850 studs off worked village doors by the inn)
+    if not probe or probe.roofed(here) then add(query(ctx, here, Tuning.doorNearUs, Tuning.doorScan)) end
     if probe then
+        -- leaving for somewhere outside, the way out can lie past the doors round us, so the doors out are looked for further off, and the room doors are worked toward the nearest of them rather than toward the target (live 2026-10-24: an upstairs inn room, the front door ~105 studs off and a floor down, every nearer door another room's, walked round in a circle)
+        local leaving = probe.roofed(here) and not probe.roofed(goal)
+        if leaving then
+            add(query(ctx, here, Tuning.doorExitScan, Tuning.doorExitLimit), function(door) return opensOut(probe, door, here) end)
+        end
+        local exit, exitGap = nil, math.huge
         for _, door in ipairs(out) do
-            local ox, oz = flatOutward(door.outward)
-            local p = door.position
-            local side = 1
-            if (here.X - p.X) * ox + (here.Z - p.Z) * oz < 0 then side = -1 end
-            local far = Vector3.new(p.X - ox * side * Tuning.doorStandoff, p.Y, p.Z - oz * side * Tuning.doorStandoff)
-            if not probe.roofed(far) then door.score = door.score - Tuning.doorOutBonus end
+            door.out = opensOut(probe, door, here)
+            if door.out then
+                door.score = door.score - Tuning.doorOutBonus
+                local gap = flatDistance(here, door.position)
+                if gap < exitGap then exit, exitGap = door, gap end
+            end
+        end
+        if leaving and exit then
+            for _, door in ipairs(out) do
+                if not door.out then door.score = flatDistance(door.position, exit.position) end
+            end
         end
     end
     table.sort(out, function(a, b) return a.score < b.score end)
@@ -32709,6 +33921,25 @@ function M.ahead(probe, from, to)
     return high
 end
 
+-- spots out under open sky level with a spot that is roofed over but open at the side, each with a clear straight line in, the nearest us first (live 2026-10-24: Merlin on the Magic Tower's balcony, a roof just over him and open from the south-west round to the east, given up on from above)
+function M.porches(probe, spot, here)
+    local out = {}
+    for i = 0, Tuning.porchDirections - 1 do
+        local a = i / Tuning.porchDirections * 2 * math.pi
+        local dx, dz = math.cos(a), math.sin(a)
+        for _, reach in ipairs(Tuning.porchReach) do
+            local porch = Vector3.new(spot.X + dx * reach, spot.Y, spot.Z + dz * reach)
+            if not probe.roofed(porch) then
+                if probe.sweep(porch, spot, true) then out[#out + 1] = porch end
+                break
+            end
+        end
+    end
+    table.sort(out, function(a, b) return (a - here).Magnitude < (b - here).Magnitude end)
+    while #out > Tuning.porchTries do table.remove(out) end
+    return out
+end
+
 -- the points from here to spot: landing ends standing on spot, otherwise the leg ends at the lowest safe height over it, never under hold (what the stretch after it needs); a raise asked for after a rewind or a hold-up is always flown, even where the straight line sweeps clear
 function M.fly(probe, here, spot, landing, raise, hold)
     local level = Water.reader()
@@ -32902,7 +34133,9 @@ function M.new(deps)
     local maid = Maid.new()
     local handle, control = {}, {}
     local finished, result, reason = false, nil, nil
-    local target, pace = nil, Tuning.ceiling
+    -- the owner may lift the ceiling for this steer alone (a race, where the game's own broom flies faster), never past steerCeilingMax
+    local ceiling = Tuning.ceiling
+    local target, pace = nil, ceiling
     local correcting, corrections = false, 0
     local climbing = false
     -- progress toward the current point, so a line nothing gets along is reported stuck rather than flown at forever
@@ -32996,8 +34229,9 @@ function M.new(deps)
         local here = liveRoot.Position
         local offset = target - here
         local gap = offset.Magnitude
-        if gap < bestGap - Tuning.steerStuckGain then
-            bestGap, bestAt, stuck = gap, now(), false
+        -- holding a point already reached is never being stuck (live 2026-10-24: a race start held through its 3 s countdown read stuck, and the race opened with a climb)
+        if gap < bestGap - Tuning.steerStuckGain or gap <= Tuning.steerStuckGain then
+            bestGap, bestAt, stuck = math.min(gap, bestGap), now(), false
         elseif now() - bestAt > Tuning.steerStuck then
             stuck = true
         end
@@ -33008,7 +34242,7 @@ function M.new(deps)
         end
         local direction = offset / gap
         -- never past the point in one step, so a held spot is held rather than circled
-        local speed = math.min(pace, Tuning.ceiling, gap / dt)
+        local speed = math.min(pace, ceiling, gap / dt)
         local flat = math.sqrt(offset.X * offset.X + offset.Z * offset.Z)
         if math.abs(offset.Y) > flat then speed = math.min(speed, Tuning.verticalSpeed) end
         local look = math.min(gap, math.max(speed * Tuning.steerLook, Tuning.steerLookMin))
@@ -33019,6 +34253,9 @@ function M.new(deps)
             return
         end
         if rising then speed = math.min(speed, Tuning.verticalSpeed / math.max(heading.Y, 0.2)) end
+        -- the server judges a climb or a drop by its rate whatever the speed along (live 2026-10-24: a 32 degree climb at 450 was rewound every time, at 300 never), so a slope is taken slower rather than steeper
+        local slope = math.abs(heading.Y)
+        if slope > 1e-3 then speed = math.min(speed, Tuning.steerClimbMax / slope) end
         rig.drive(heading * speed, flatFacing(heading) or flatFacing(offset) or flatFacing(liveRoot.CFrame.LookVector))
     end
 
@@ -33030,7 +34267,15 @@ function M.new(deps)
             bestGap, bestAt, stuck = math.huge, now(), false
         end
         target = point
-        if type(speed) == "number" and speed > 0 then pace = math.min(speed, Tuning.ceiling) end
+        if type(speed) == "number" and speed > 0 then pace = math.min(speed, ceiling) end
+        return true
+    end
+
+    -- (true) raises or lowers this steer's ceiling, from the usual one up to steerCeilingMax
+    function handle.ceiling(value)
+        if finished or type(value) ~= "number" or value ~= value then return false end
+        ceiling = math.clamp(value, Tuning.placeSpeed, Tuning.steerCeilingMax)
+        pace = math.min(pace, ceiling)
         return true
     end
 
@@ -40164,6 +41409,7 @@ local Races     = require("Features/Clover/Farm/Races")
 local REFRESH_EVERY = 0.5
 local MOB_FARM, NODE_FARM, RACE_FARM, QUEST_FARM, BOSS_FARM = "Mob Farm", "Gathering Farm", "Broom Race Farm", "Quest Farm", "Boss Farm"
 local DEFAULT_COURSE = "Kamo Broom Blitz"
+local RACE_SPEED = 330
 local STOP_LINES = {
     died  = "The farm stopped because you died too many times in a row.",
     fault = "The farm hit a problem and stopped. Try switching it on again.",
@@ -40207,12 +41453,13 @@ return function(ctx)
     }
     -- parrying and the instakill are premium: the brain checks the gate itself, since a locked toggle that starts on keeps its value
     local mobCfg = {
-        names = {}, heavy = true, skills = true, instakill = true, instakillMode = false, block = true, parry = true,
+        names = {}, heavy = true, skills = true, instakill = true, instakillMode = false, block = true, parry = true, dodge = true,
         locked = Premium.isLocked,
     }
     local nodeCfg = { items = {}, ownTools = true }
-    local raceCfg = { course = DEFAULT_COURSE, speed = 250, challenge = true }
-    local questCfg = { givers = {} }
+    -- the race speed is fixed: the user found 330 fast and never pulled back (2026-10-24)
+    local raceCfg = { course = DEFAULT_COURSE, speed = RACE_SPEED, challenge = true, best = true }
+    local questCfg = { givers = {}, best = true }
     local bossCfg = { bosses = {}, loot = true }
     local brains = {
         [MOB_FARM]   = Mobs.new(mobCfg),
@@ -40331,6 +41578,13 @@ return function(ctx)
             Tooltip  = "Runs Auto Parry while the farm fights: it parries monsters' attacks right as they land, never starts a swing an attack would interrupt, and saves heavy attacks for the moments the monster can't hit back (stunned, just parried, or resting after its own attack).",
             Callback = function(on) mobCfg.parry = on == true end,
         })
+        depends:AddToggle("FarmMobDodge", {
+            Premium  = true,
+            Text     = "Roll Through Special Attacks",
+            Default  = true,
+            Tooltip  = "With parrying on, a monster's special attacks (the big ones it can't be stopped out of) are rolled through instead of parried, and the farm never swings into one. Bosses use the same setting.",
+            Callback = function(on) mobCfg.dodge = on == true end,
+        })
         depends:AddLabel("Parrying learns each monster's attack timing as it fights and remembers it, so it gets better the longer you farm. An attack it hasn't seen yet is blocked the first time while it learns it.", true)
         depends:AddToggle("FarmMobInstakill", {
             Premium  = true,
@@ -40396,6 +41650,13 @@ return function(ctx)
         }):AddKeyPicker("FarmQuestsKey", { Premium = true, Default = "None", Mode = "Toggle", Text = QUEST_FARM, SyncToggleState = true })
         local depends = questBox:AddDependencyBox()
         labels[QUEST_FARM] = depends:AddLabel("Off", true)
+        depends:AddToggle("FarmQuestBest", {
+            Premium  = true,
+            Text     = "Pick The Best Quests",
+            Default  = true,
+            Tooltip  = "Does every quest the farm can do, the ones that pay the most XP and Marks for the time they take first. It skips quests your tools or the time of day rule out. The list below is only used with this off.",
+            Callback = function(on) questCfg.best = on == true end,
+        })
         questPicker = depends:AddDropdown("FarmQuestList", {
             Premium    = true,
             Text       = "Quests",
@@ -40452,14 +41713,16 @@ return function(ctx)
     local coursePicker
     if raceBox then
         raceBox:AddToggle("FarmRaces", {
+            Premium  = true,
             Text     = RACE_FARM,
             Default  = false,
             Tooltip  = "Races the broom course you pick over and over for Broom Flying XP: it starts the race, flies to the start and through every gate for you.",
             Callback = function(on) switch(RACE_FARM, on == true) end,
-        }):AddKeyPicker("FarmRacesKey", { Default = "None", Mode = "Toggle", Text = RACE_FARM, SyncToggleState = true })
+        }):AddKeyPicker("FarmRacesKey", { Premium = true, Default = "None", Mode = "Toggle", Text = RACE_FARM, SyncToggleState = true })
         local depends = raceBox:AddDependencyBox()
         labels[RACE_FARM] = depends:AddLabel("Off", true)
         coursePicker = depends:AddDropdown("FarmRaceCourse", {
+            Premium  = true,
             Text     = "Course",
             Values   = { DEFAULT_COURSE },
             Default  = DEFAULT_COURSE,
@@ -40468,17 +41731,15 @@ return function(ctx)
                 if type(value) == "string" and value ~= "" then raceCfg.course = value end
             end,
         })
-        depends:AddSlider("FarmRaceSpeed", {
-            Text     = "Race Speed",
-            Default  = 250,
-            Min      = 100,
-            Max      = 300,
-            Rounding = 0,
-            Suffix   = " studs/s",
-            Tooltip  = "How fast it flies the course. 300 is the game's own racing broom speed. Fast times go on the course's monthly leaderboard where everyone can see them, so you may want to stay a little under the top.",
-            Callback = function(value) raceCfg.speed = tonumber(value) or raceCfg.speed end,
+        depends:AddToggle("FarmRaceBest", {
+            Premium  = true,
+            Text     = "Pick The Best Course",
+            Default  = true,
+            Tooltip  = "Picks the course for you: it races each one a couple of times to see how much XP it gives for the time it takes, then keeps racing the best. The course above is only used with this off.",
+            Callback = function(on) raceCfg.best = on == true end,
         })
         depends:AddToggle("FarmRaceChallenge", {
+            Premium  = true,
             Text     = "Take Rank Challenges",
             Default  = true,
             Tooltip  = "When your Broom Flying is ready to rank up, takes the rank challenge and races its course for you.",
@@ -40651,12 +41912,14 @@ end
 
 end)
 __bundle_register("Features/Clover/Farm/Races", function(require, _LOADED, __bundle_register, __bundle_modules)
--- broom race farm brain: asks the race server for your course (or the Broom Flying rank challenge's course once one is ready), flies to its start marker on the broom, holds there through the countdown, then steers through each gate the moment the server shows it, lining up first when it would clip the ring's edge and flying a gate again when the server didn't count it; then it goes again
+-- broom race farm brain: asks the race server for your course (or the Broom Flying rank challenge's course once one is ready) and heads for its start while the server answers, holds there through the countdown, then flies the whole course in one smooth line it knows ahead of time (the course laid out in the map or the last one flown, through the speed orbs on the way) without waiting for the server to show each gate; a course not known yet, or a gate the server didn't count, is flown gate by gate as the server shows them, lining up first when it would clip the ring's edge; then it goes again
+local Services = require("Services")
+local RaceLine = require("Features/Clover/Farm/RaceLine")
+
 local M = {}
 
--- the countdown began with the root 1.3 from the marker (live 2026-10-24); a marker further off than FAR is reached by a planned trip, nearer it is steered at
+-- the countdown began with the root 1.3 from the marker (live 2026-10-24)
 local START_REACH = 1.5
-local FAR = 120
 -- the server answers Start with the marker within a frame or two (live), and drops a race nobody reached the start of after ~180 s
 local ASK_WAIT = 4
 local START_LIMIT = 150
@@ -40673,8 +41936,23 @@ local CLIMB_OUT = 60
 local CLIMB_TIME = 1.5
 local CHALLENGE = "Broom Flying"
 local CHALLENGE_TRIES = 2
+-- the line is steered at this far ahead, a quarter second of flight
+local LOOK_TIME = 0.25
+local LOOK_MIN, LOOK_MAX = 25, 120
+-- a known gate further than this from the one the server shows means the course changed, and the line is dropped
+local ROUTE_MATCH = 25
+-- a start further than this is reached by a planned trip, nearer it is steered at while the server answers
+local START_STEER = 1500
+-- the course raced now is kept unless another pays more than this many times its XP a second
+local SWITCH_MARGIN = 1.05
+-- the broom's speed outside a race, where the server pulls back anything faster (live 2026-10-24: 350 and up rewound)
+local OUTSIDE = 300
+-- anything solid this far over the root means indoors, where steering in a straight line only presses the broom into the ceiling (the user, 2026-10-24: switched on inside the inn, the character hung there unable to move), so the start is reached by a planned trip that finds the way out
+local ROOF_CHECK = 120
+-- past a gate's plane this close to it, a crossing the server doesn't count is a missed ring
+local MISS_NEAR = 60
 
--- cfg is the live settings table the menu writes: course, speed, challenge
+-- cfg is the live settings table the menu writes: course, speed, challenge, best (pick the course by XP a second)
 function M.new(cfg)
     local brain = {}
     local steer = nil
@@ -40682,10 +41960,12 @@ function M.new(cfg)
     local lastAim, lastDir = nil, nil
     local gates = {}
     local racingApi, seenAt = nil, nil
+    -- the line for the race under way: { course, nodes, points, at, off (a gate it fell back to flying by sight) }
+    local line = nil
 
     function brain.begin()
         steer, challengeCourse, challengeTries = nil, nil, 0
-        lastAim, lastDir, gates, seenAt = nil, nil, {}, nil
+        lastAim, lastDir, gates, seenAt, line = nil, nil, {}, nil, nil
     end
 
     -- a race not yet under way is given up when the farm stops; one mid-course ends at its next gate whenever the farm (or the player) flies it
@@ -40694,13 +41974,45 @@ function M.new(cfg)
         if racingApi then pcall(racingApi.quit) end
     end
 
-    local function steering(kit)
-        if steer then
-            local status = steer.status()
-            if status.state ~= "ended" and status.state ~= "arrived" then return steer end
+    -- racing, the broom may go as fast as the race speed asks; anywhere else the usual ceiling holds, which is all the server takes off a race
+    local function steering(kit, racing)
+        if not (steer and steer.status().state ~= "ended" and steer.status().state ~= "arrived") then steer = kit.steer() end
+        if steer and steer.ceiling then
+            local speed = cfg.speed or OUTSIDE
+            if not racing then speed = math.min(speed, OUTSIDE) end
+            steer.ceiling(speed)
         end
-        steer = kit.steer()
         return steer
+    end
+
+    -- the best course by XP a second: one not raced twice yet is tried first (nearest its start), then the best of the rest, staying put unless another is clearly better
+    local current = nil
+    local function bestCourse(kit)
+        local Racing = kit.api("Racing")
+        if not Racing then return nil end
+        local okList, list = Racing.courses()
+        local okRates, rates = Racing.rates()
+        if not (okList and okRates) or type(list) ~= "table" or #list == 0 then return nil end
+        local here = kit.position()
+        local untried, untriedGap = nil, math.huge
+        local best, bestRate = nil, -1
+        for _, course in ipairs(list) do
+            local r = rates[course.name]
+            if not (r and r.rate) then
+                local gap = (here and course.start) and (course.start - here).Magnitude or math.huge
+                if gap < untriedGap then untried, untriedGap = course.name, gap end
+            elseif r.rate > bestRate then
+                best, bestRate = course.name, r.rate
+            end
+        end
+        if untried then
+            current = untried
+            return untried
+        end
+        local held = current and rates[current] and rates[current].rate
+        if held and held * SWITCH_MARGIN >= bestRate then return current end
+        current = best
+        return best
     end
 
     -- the rank challenge is taken as soon as it's ready and its course raced next; its course stays picked through a failed try or two
@@ -40719,7 +42031,9 @@ function M.new(cfg)
                 end
             end
         end
-        return challengeCourse or cfg.course
+        if challengeCourse then return challengeCourse end
+        if cfg.best then return bestCourse(kit) or cfg.course end
+        return cfg.course
     end
 
     -- the point to fly at for this gate: through its middle, or lined up in front of it first
@@ -40766,8 +42080,39 @@ function M.new(cfg)
         end
     end
 
+    local roofParams = nil
+    local function indoors(kit)
+        local root = kit.root()
+        if not root then return false end
+        if not roofParams then
+            roofParams = RaycastParams.new()
+            roofParams.FilterType = Enum.RaycastFilterType.Exclude
+        end
+        roofParams.FilterDescendantsInstances = { root.Parent }
+        local ok, hit = pcall(Services.Workspace.Raycast, Services.Workspace, root.Position, Vector3.new(0, ROOF_CHECK, 0), roofParams)
+        return ok and hit ~= nil
+    end
+
+    local function lineFor(Racing, s)
+        if line and line.course == s.course then return line end
+        line = nil
+        if not (s.course and s.start) then return nil end
+        local ok, route = Racing.route(s.course)
+        if not ok or type(route) ~= "table" or #route.points == 0 then return nil end
+        line = { course = s.course, points = route.points, nodes = RaceLine.build(s.start, route.points), at = 1 }
+        return line
+    end
+
+    -- the line is trusted only while the gate the server shows is the one it expects there
+    local function onLine(l, s)
+        local gate = s.gate
+        if not gate then return true end
+        local expected = l.points[(s.passed or 0) + 1]
+        return expected ~= nil and (expected.position - gate.position).Magnitude <= ROUTE_MATCH
+    end
+
     local function fly(kit, Racing)
-        local handle = steering(kit)
+        local handle = steering(kit, true)
         if not handle then
             kit.status("Waiting for your broom.")
             kit.sleep(0.5)
@@ -40780,11 +42125,49 @@ function M.new(cfg)
             if status.state == "ended" then return end
             local here = kit.position()
             if here then
+                local l = lineFor(Racing, s)
+                local now = os.clock()
+                local passed = s.passed or 0
+                if l and not onLine(l, s) then
+                    line, l = nil, nil
+                end
+                -- a gate the line went through that the server didn't count is flown again by sight until it does
+                if l and l.off and passed >= l.off then l.off = nil end
+                local aim = nil
+                if l and not l.off then
+                    l.at = RaceLine.advance(l.nodes, l.at, here, passed, l.prev, s.gate and s.gate.radius or 12.5)
+                    l.prev = here
+                    -- run on ahead of the server's count for longer than its lag (live 2026-10-24: a rewind past a ring, then hovering at the finish while the server still wanted gate 3): back to the gate it wants
+                    if RaceLine.heading(l.nodes, l.at) > passed + 1 then
+                        l.aheadAt = l.aheadAt or now
+                        if now - l.aheadAt > RETRY_AFTER then l.at, l.aheadAt = RaceLine.resync(l.nodes, passed), nil end
+                    else
+                        l.aheadAt = nil
+                    end
+                    -- through the gate's plane near it, on the far side from the way in, with no count from the server: missed the ring
+                    local nextGate = l.points[passed + 1]
+                    local wayIn = passed > 0 and l.points[passed].position or s.start
+                    local n = nextGate and nextGate.normal
+                    if n and wayIn and s.gate and (here - nextGate.position).Magnitude <= MISS_NEAR
+                        and (here - nextGate.position):Dot(n) * (wayIn - nextGate.position):Dot(n) < 0 then
+                        l.beyondAt = l.beyondAt or now
+                        if now - l.beyondAt > RETRY_AFTER then l.off, l.beyondAt = passed + 1, nil end
+                    else
+                        l.beyondAt = nil
+                    end
+                    if not l.off then
+                        local look = math.clamp((cfg.speed or 300) * LOOK_TIME, LOOK_MIN, LOOK_MAX)
+                        aim = RaceLine.carrot(l.nodes, l.at, here, look, s.gate and s.gate.radius or 12.5)
+                    end
+                end
                 local gate = s.gate
-                if gate then
-                    local aim, dir = aimFor(gate, here, os.clock())
-                    lastAim, lastDir = aim, dir
+                if aim then
                     handle.toward(aim, cfg.speed)
+                    kit.status(("Racing %s: gate %d of %d."):format(s.course or "the course", math.min(passed + 1, #l.points), #l.points))
+                elseif gate then
+                    local gateAim, dir = aimFor(gate, here, now)
+                    lastAim, lastDir = gateAim, dir
+                    handle.toward(gateAim, cfg.speed)
                     if gate.finish then
                         kit.status(("Racing %s: heading for the finish."):format(s.course or "the course"))
                     else
@@ -40793,7 +42176,8 @@ function M.new(cfg)
                 elseif lastAim and lastDir then
                     handle.toward(lastAim + lastDir * CARRY, cfg.speed)
                 end
-                if status.stuck then
+                -- read after the new aim, so a stand still held through the countdown never reads as stuck
+                if handle.status().stuck then
                     kit.status("Something is in the way, so the farm is going over it.")
                     handle.toward(here + Vector3.new(0, CLIMB_OUT, 0), cfg.speed)
                     if not kit.sleep(CLIMB_TIME) then return end
@@ -40803,16 +42187,41 @@ function M.new(cfg)
         end
     end
 
+    -- the character's XP now, with what a level-up rolled over counted in
+    local xpSeen = nil
+    local function xpGained(kit)
+        local State = kit.api("State")
+        if not State then return nil end
+        local ok, p = State.profile()
+        if not (ok and type(p) == "table" and type(p.xp) == "number" and type(p.level) == "number") then return nil end
+        local before = xpSeen
+        xpSeen = { xp = p.xp, level = p.level, max = p.maxXp }
+        if not before then return nil end
+        if p.level == before.level then return math.max(p.xp - before.xp, 0) end
+        if p.level == before.level + 1 and type(before.max) == "number" then return math.max(before.max - before.xp, 0) + p.xp end
+        return nil
+    end
+
+    local lastFinish = nil
     local function record(kit, Racing)
         local ok, last = Racing.last()
         if not ok then return end
         -- a race that ended before the farm started isn't the farm's
         if seenAt == nil then
             seenAt = type(last) == "table" and last.at or false
+            xpGained(kit)
             return
         end
         if type(last) ~= "table" or last.at == seenAt then return end
         seenAt = last.at
+        local xp = xpGained(kit)
+        if last.finished and last.course and xp then
+            -- the time from one finish to the next counts only between two races of the same course
+            local cycle = nil
+            if lastFinish and lastFinish.course == last.course then cycle = last.at - lastFinish.at end
+            Racing.note(last.course, xp, cycle)
+        end
+        lastFinish = last.finished and { course = last.course, at = last.at } or nil
         if last.finished then
             kit.add("races")
             local line = ("%s in %.2fs"):format(last.course or "a race", last.time or 0)
@@ -40847,16 +42256,25 @@ function M.new(cfg)
                 kit.sleep(1)
                 return
             end
-            gates, lastAim, lastDir = {}, nil, nil
+            gates, lastAim, lastDir, line = {}, nil, nil, nil
             local started = Racing.start(course)
             if not started then
                 kit.status(("Couldn't start %s right now."):format(course))
                 kit.sleep(2)
                 return
             end
+            -- the server takes a second or so to answer (it ranks the last race first), which is spent getting to the start
+            local okPoint, startPoint = Racing.startPoint(course)
+            local here = kit.position()
+            local handle = nil
+            if okPoint and here and (here - startPoint).Magnitude <= START_STEER and not indoors(kit) then
+                handle = steering(kit)
+                if handle then handle.toward(startPoint, cfg.speed) end
+            end
+            kit.status(("Asking to race %s."):format(course))
             local limit = os.clock() + ASK_WAIT
             while os.clock() < limit do
-                if not kit.sleep(0.1) then return end
+                if not kit.sleep(0) then return end
                 local okNow, now = Racing.status()
                 if okNow and now.phase ~= "starting" then return end
             end
@@ -40883,7 +42301,7 @@ function M.new(cfg)
                 return
             end
             local gap = (here - s.start).Magnitude
-            if gap > FAR then
+            if gap > START_STEER or indoors(kit) then
                 kit.status(("Flying to the start of %s (%d studs away)."):format(s.course or "the race", math.floor(gap)))
                 steer = nil
                 kit.travel(s.start, { air = true, reach = START_REACH })
@@ -40913,11 +42331,161 @@ end
 return M
 
 end)
+__bundle_register("Features/Clover/Farm/RaceLine", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- race line: one line through a whole known course (the start, every speed orb close enough to the way to be worth the detour, each gate's centre, then on past the finish) and the point to steer at on it: a lookahead down the line, so the broom never slows or waits at a gate, that only cuts a corner where the straight chord from here still goes through the gate's ring and past the orb it would skip
+local M = {}
+
+-- an orb this far off the straight way between two gates is flown through, one further off is left
+local ORB_DETOUR = 18
+-- an orb counts as taken this close, and the chord may pass this close to one it cuts past
+local ORB_TOUCH = 5
+-- the chord may cross a gate's plane this far out along its radius
+local RING_USE = 0.65
+-- a step longer than this between two frames is the server putting the root back (a rewind), not flight, so it flies through no ring
+local MAX_STEP = 40
+-- the line carries on this far past the finish, so it's crossed at speed, and a gate whose corner can't be cut is aimed this far past its centre
+local RUN_OUT = 40
+local PAST_CENTRE = 10
+
+local function unit(v)
+    local length = v.Magnitude
+    if length < 1e-6 then return nil end
+    return v / length
+end
+
+-- start (the marker) and points ({ position, normal, orbs, finish }) to nodes: { position, kind = "orb" | "gate" | "out", gate (its number), normal }
+function M.build(start, points)
+    local nodes = {}
+    local prev = start
+    for i, point in ipairs(points) do
+        local seg = point.position - prev
+        local length = seg.Magnitude
+        local dir = unit(seg)
+        local orbs = {}
+        if dir then
+            for _, orb in ipairs(point.orbs or {}) do
+                local along = (orb - prev):Dot(dir)
+                if along > 0 and along < length and ((prev + dir * along) - orb).Magnitude <= ORB_DETOUR then
+                    orbs[#orbs + 1] = { position = orb, along = along }
+                end
+            end
+        end
+        table.sort(orbs, function(a, b) return a.along < b.along end)
+        for _, orb in ipairs(orbs) do nodes[#nodes + 1] = { position = orb.position, kind = "orb" } end
+        nodes[#nodes + 1] = { position = point.position, kind = "gate", gate = i, normal = point.normal }
+        prev = point.position
+    end
+    local last = nodes[#nodes]
+    local before = #nodes > 1 and nodes[#nodes - 1].position or start
+    local away = last and unit(last.position - before)
+    if away then nodes[#nodes + 1] = { position = last.position + away * RUN_OUT, kind = "out" } end
+    return nodes
+end
+
+-- whether the straight chord from a to b crosses a gate's plane inside its ring, or inside share of its radius (the line keeps to RING_USE of it)
+function M.through(a, b, node, radius, share)
+    local n = node.normal
+    local da, db = (a - node.position):Dot(n), (b - node.position):Dot(n)
+    if da * db > 0 or da == db then return false end
+    local cross = a + (b - a) * (da / (da - db))
+    return (cross - node.position).Magnitude <= radius * (share or RING_USE)
+end
+
+local function distanceToChord(point, a, b)
+    local ab = b - a
+    local length2 = ab:Dot(ab)
+    if length2 < 1e-9 then return (point - a).Magnitude end
+    local t = math.clamp((point - a):Dot(ab) / length2, 0, 1)
+    return (a + ab * t - point).Magnitude
+end
+
+-- the first node from `at` still ahead: a gate neither counted by the server (passed is how many it has) nor just flown through (the step from prev to here went through its ring; the server's count lags a crossing by 0.1-0.25 s, and waiting on it turned the broom back round for a gate behind it), or an orb not yet reached or gone by
+function M.advance(nodes, at, here, passed, prev, radius)
+    while at <= #nodes do
+        local node = nodes[at]
+        if node.kind == "gate" then
+            if not node.flown and prev and radius and (here - prev).Magnitude <= MAX_STEP and M.through(prev, here, node, radius, 1) then node.flown = true end
+            if node.gate > passed and not node.flown then return at end
+        elseif node.kind == "orb" then
+            local nextNode = nodes[at + 1]
+            local reached = (here - node.position).Magnitude <= ORB_TOUCH
+            local gone = nextNode and (here - node.position):Dot(nextNode.position - node.position) > 0
+            if not (reached or gone) then return at end
+        else
+            return at
+        end
+        at = at + 1
+    end
+    return at
+end
+
+-- the number of the gate the line is heading for from node `at` (one past the last once it has run out)
+function M.heading(nodes, at)
+    for i = at, #nodes do
+        if nodes[i].kind == "gate" then return nodes[i].gate end
+    end
+    local count = 0
+    for _, node in ipairs(nodes) do
+        if node.kind == "gate" then count = count + 1 end
+    end
+    return count + 1
+end
+
+-- the line put back to the gate after the last the server counted, every gate past it to be flown again: for a line that ran on ahead of the server (a ring it thought it went through that never counted)
+function M.resync(nodes, passed)
+    local at = nil
+    for i, node in ipairs(nodes) do
+        if node.kind == "gate" and node.gate > passed then
+            node.flown = nil
+            if not at then at = i end
+        end
+    end
+    return at or #nodes + 1
+end
+
+-- the point to steer at: lookahead studs on down the line from here through node `at` and the ones after, pulled back to the first gate or orb whose corner the straight chord would cut too fine
+function M.carrot(nodes, at, here, lookahead, radius)
+    if at > #nodes then return nil end
+    local remaining, from, i = lookahead, here, at
+    local target = nil
+    while i <= #nodes do
+        local to = nodes[i].position
+        local length = (to - from).Magnitude
+        if length >= remaining then
+            target = from + (to - from) * (remaining / length)
+            break
+        end
+        remaining = remaining - length
+        from = to
+        i = i + 1
+    end
+    if not target then return nodes[#nodes].position end
+    for k = at, i - 1 do
+        local node = nodes[k]
+        if node.kind == "gate" and not M.through(here, target, node, radius) then
+            -- a little past the centre along the way on, so the broom goes through rather than stopping in it
+            local nextNode = nodes[k + 1]
+            local on = nextNode and unit(nextNode.position - node.position)
+            if on then
+                local past = node.position + on * PAST_CENTRE
+                if M.through(here, past, node, radius) then return past end
+            end
+            return node.position
+        end
+        if node.kind == "orb" and distanceToChord(node.position, here, target) > ORB_TOUCH * 0.8 then return node.position end
+    end
+    return target
+end
+
+return M
+
+end)
 __bundle_register("Features/Clover/Farm/Quests", function(require, _LOADED, __bundle_register, __bundle_modules)
--- quest farm brain: works through the repeatable quests you pick: takes one whose giver is off cooldown (nearest first), does its tasks with the farm's own brains (the gathering farm for a gather, the mob farm for a hunt where the quest points, the race farm for a race), hands it in at the giver and goes on, waiting out the cooldowns when every quest is resting; a quest it has no way to do is left alone
-local Mobs  = require("Features/Clover/Farm/Mobs")
-local Nodes = require("Features/Clover/Farm/Nodes")
-local Races = require("Features/Clover/Farm/Races")
+-- quest farm brain: works through the repeatable quests you pick: takes one whose giver is off cooldown (nearest first), does its tasks with the farm's own brains (the gathering farm for a gather, the mob farm for a hunt where the quest points, the race farm for a race) or by hand (a 'Hit the ...' task, struck with light attacks; an item no node gives, bought at a shop), hands it in at the giver and goes on, waiting out the cooldowns when every quest is resting; a quest it has no way to do is left alone
+local Services = require("Services")
+local Mobs     = require("Features/Clover/Farm/Mobs")
+local Nodes    = require("Features/Clover/Farm/Nodes")
+local Races    = require("Features/Clover/Farm/Races")
 
 local M = {}
 
@@ -40931,7 +42499,19 @@ local AREA = 250
 -- a hunt with none of its monsters about for this long (Night Charmers only come out after dark) is set aside this long while other quests go on
 local NO_MOB_WAIT = 45
 local SET_ASIDE = 300
+-- monsters that only come out after dark (live 2026-10-24: Night Charmers), whose hunts wait out the day rather than fly over to find nothing; the game's night by Lighting.ClockTime
+local NIGHT_ONLY = { ["Night Charmer"] = true }
+local DUSK, DAWN = 18, 6
+-- picking the best quests itself: what each pays (its XP, and a Mark counted as this much XP) over a guess at its time, travel at this speed plus each task's own, worked out again this often
+local MARK_WORTH = 2
+local GUESS_SPEED = 250
+local GUESS = { collect = 10, buy = 8, kill = 45, boss = 150, race = 15, hit = 0.9, handIn = 5 }
+local RANK_EVERY = 30
 local WAIT = 5
+-- a "Hit the ..." task (Captain Hayes' Whack-a-Dummy, live 2026-10-24: 35 hits on any of three Training Dummies in the Kamo Encampment) is struck from this close, one light attack at a time, looking for the target this far round where the quest points
+local HIT_REACH = 5
+local HIT_AREA = 60
+local HIT_GAP = 0.35
 
 local function distance(a, b)
     return (a - b).Magnitude
@@ -40946,6 +42526,12 @@ local function chosenList(set)
     return out
 end
 
+-- a quest title that ends in its own "!" or "?" (Boar Hunt!) takes no full stop after it
+local function say(kit, fmt, ...)
+    local text = fmt:format(...):gsub("([!?])%.", "%1")
+    kit.status(text)
+end
+
 local function minutes(seconds)
     if seconds < 60 then return ("%ds"):format(math.ceil(seconds)) end
     return ("%dm %02ds"):format(math.floor(seconds / 60), math.floor(seconds % 60))
@@ -40956,15 +42542,18 @@ function M.new(cfg, shared)
     local brain = {}
     local mobCfg = setmetatable({ names = {} }, { __index = shared.mob })
     local nodeCfg = setmetatable({ items = {} }, { __index = shared.node })
-    local raceCfg = setmetatable({ course = nil, challenge = false }, { __index = shared.race })
+    local raceCfg = setmetatable({ course = nil, challenge = false, best = false }, { __index = shared.race })
     local subs = { kill = Mobs.new(mobCfg), collect = Nodes.new(nodeCfg), race = Races.new(raceCfg) }
     local using = nil
     local readyAt, askedAt, skipped, unable = {}, {}, {}, {}
     local aside, emptySince = {}, nil
     local gatherable = nil
+    -- best mode's ranking of the quests, kept for RANK_EVERY
+    local ranked, rankedAt = nil, -math.huge
 
     function brain.begin()
         using, readyAt, askedAt, skipped, unable, gatherable = nil, {}, {}, {}, {}, nil
+        ranked, rankedAt = nil, -math.huge
         aside, emptySince = {}, nil
         for _, sub in pairs(subs) do
             if sub.begin then sub.begin() end
@@ -41037,7 +42626,7 @@ function M.new(cfg, shared)
         local spot = (model and model:GetPivot().Position) or at
         if not spot then return nil end
         if distance(here, spot) > GIVER_REACH + 2 then
-            kit.status(("Flying to %s (%d studs away)."):format(name, math.floor(distance(here, spot))))
+            say(kit, "Flying to %s (%d studs away).", name, math.floor(distance(here, spot)))
             kit.travel(spot, { reach = GIVER_REACH })
             return nil
         end
@@ -41051,7 +42640,7 @@ function M.new(cfg, shared)
     local function handIn(kit, Quests, quest, template)
         local model = reachGiver(kit, quest.giver, (template and template.position) or quest.returnAt)
         if not model then return end
-        kit.status(("Handing in %s."):format(quest.title))
+        say(kit, "Handing in %s.", quest.title)
         local ok = Quests.turnIn(quest.key)
         if not ok then
             -- the game's own dialogue hands it in on opening (DM.lua:93-106) when the plain send was not taken
@@ -41074,6 +42663,109 @@ function M.new(cfg, shared)
         end
     end
 
+    -- the nearest model named like the task's target ("Hit the Training Dummy") that has a Humanoid, round where the quest points
+    local function hitTarget(task)
+        local wanted = string.match(task.name or "", "^Hit the (.+)$") or string.match(task.name or "", "^Hit (.+)$")
+        if not (wanted and task.position) then return nil end
+        local okParts, parts = pcall(function() return Services.Workspace:GetPartBoundsInRadius(task.position, HIT_AREA) end)
+        if not okParts then return nil, wanted end
+        local best, bestGap, seen = nil, math.huge, {}
+        for _, part in ipairs(parts) do
+            local model = part:FindFirstAncestorOfClass("Model")
+            if model and not seen[model] and model.Name == wanted and model:FindFirstChildOfClass("Humanoid") then
+                seen[model] = true
+                local okAt, at = pcall(function() return model:GetPivot().Position end)
+                if okAt and distance(at, task.position) < bestGap then best, bestGap = { model = model, position = at }, distance(at, task.position) end
+            end
+        end
+        return best, wanted
+    end
+
+    -- answers false when the task isn't one it knows how to hit
+    local function hit(kit, quest, task)
+        local target, wanted = hitTarget(task)
+        if not wanted then return false end
+        local here = kit.position()
+        if not here then return true end
+        if not target then
+            if task.position and distance(here, task.position) > HIT_REACH * 4 then
+                say(kit, "Flying to the %s for %s.", wanted, quest.title)
+                kit.travel(task.position, { reach = 10 })
+            else
+                kit.sleep(1)
+            end
+            return true
+        end
+        if distance(here, target.position) > HIT_REACH + 2 then
+            kit.travel(target.position, { reach = HIT_REACH })
+            return true
+        end
+        if kit.flying() then
+            kit.land()
+            return true
+        end
+        local Combat = kit.api("Combat")
+        if not Combat then
+            kit.sleep(1)
+            return true
+        end
+        local okWeapon, weapon = Combat.weapon()
+        if not okWeapon then
+            unable[quest.key] = ("%s needs a weapon to hit the %s with."):format(quest.title, wanted)
+            return true
+        end
+        if not weapon.equipped then
+            Combat.equipWeapon()
+            kit.sleep(0.5)
+            return true
+        end
+        kit.face(target.position)
+        Combat.attack("light")
+        kit.sleep(HIT_GAP)
+        return true
+    end
+
+    -- an item no node gives but a shop sells (live 2026-10-24: Wood at 5 Marks in Kamo): what's still missing is bought there; answers false when no shop is known for it
+    local function buyFor(kit, quest, task)
+        local Shop = kit.api("Shop")
+        local here = kit.position()
+        if not (Shop and here and task.target) then return false end
+        local ok, list = Shop.find(task.target, here)
+        if not ok or type(list) ~= "table" or #list == 0 then return false end
+        local listing = list[1]
+        local need = math.max((task.max or 1) - (task.progress or 0), 1)
+        local count = math.min(need, Shop.MAX_BUY)
+        local State = kit.api("State")
+        local okProfile, profile = false, nil
+        if State then okProfile, profile = State.profile() end
+        local marks = okProfile and type(profile) == "table" and tonumber(profile.marks) or nil
+        if listing.price and marks and marks < listing.price * count then
+            unable[quest.key] = ("%s needs %d %s, and buying them costs %d Marks (you have %d)."):format(quest.title, need, task.target, listing.price * count, marks)
+            return true
+        end
+        if distance(here, listing.position) > Shop.REACH - 2 then
+            say(kit, "Flying to the shop to buy %s for %s.", task.target, quest.title)
+            kit.travel(listing.position, { reach = Shop.REACH - 4 })
+            return true
+        end
+        if kit.flying() then
+            kit.land()
+            return true
+        end
+        say(kit, "Buying %d %s for %s.", count, task.target, quest.title)
+        local bought, why = Shop.buy(task.target, count)
+        if not bought then
+            if why == Shop.Errors.NO_MARKS then
+                unable[quest.key] = ("%s needs more Marks to buy %s."):format(quest.title, task.target)
+            else
+                kit.sleep(2)
+            end
+        else
+            kit.sleep(1)
+        end
+        return true
+    end
+
     -- one piece of the task, done by the brain that farms that kind of thing
     local function work(kit, Quests, quest, task)
         local here = kit.position()
@@ -41089,8 +42781,16 @@ function M.new(cfg, shared)
                 unable[quest.key] = ("Couldn't tell which monster %s wants."):format(quest.title)
                 return
             end
-            local set = {}
-            for _, name in ipairs(names) do set[name] = true end
+            local set, nightOnly = {}, true
+            for _, name in ipairs(names) do
+                set[name] = true
+                if not NIGHT_ONLY[name] then nightOnly = false end
+            end
+            local clock = Services.Lighting.ClockTime
+            if nightOnly and clock >= DAWN and clock < DUSK then
+                aside[quest.key] = os.clock() + SET_ASIDE
+                return
+            end
             mobCfg.names = set
             if task.position then
                 kit.setHome(task.position)
@@ -41101,7 +42801,7 @@ function M.new(cfg, shared)
                     near = okNear and type(list) == "table" and list[1] or nil
                 end
                 if not near and here and distance(here, task.position) > AREA then
-                    kit.status(("Flying to where the %s are for %s."):format(names[1], quest.title))
+                    say(kit, "Flying to the %s hunt for %s.", names[1], quest.title)
                     switch(kit, "kill")
                     kit.travel(task.position, { reach = 40 })
                     return
@@ -41124,7 +42824,107 @@ function M.new(cfg, shared)
             raceCfg.course = task.target
             return switch(kit, "race").step(kit)
         end
+        if task.kind == "other" and hit(kit, quest, task) then return end
+        if task.kind == "collect" and buyFor(kit, quest, task) then return end
         unable[quest.key] = ("%s needs something the farm can't do yet (%s)."):format(quest.title, task.name)
+    end
+
+    local function isNight()
+        local clock = Services.Lighting.ClockTime
+        return clock >= DUSK or clock < DAWN
+    end
+
+    -- a node of these items the farm's tools can gather
+    local function toolsGather(kit, items)
+        local Professions = kit.api("Professions")
+        if not Professions then return false end
+        for _, kind in ipairs({ "Ore", "Harvest" }) do
+            local okPower, power = Professions.toolPower(kind)
+            if okPower and (tonumber(power) or 0) > 0 then
+                local ok, list = Professions.nodes({ kind = kind, items = items, maxPower = power, limit = 1 })
+                if ok and type(list) == "table" and #list > 0 then return true end
+            end
+        end
+        return false
+    end
+
+    local bossNames = nil
+    local function isBoss(kit, names)
+        if bossNames == nil then
+            local World = kit.api("World")
+            local ok, beasts = false, nil
+            if World then ok, beasts = World.beasts() end
+            if not (ok and type(beasts) == "table") then return false end
+            bossNames = {}
+            for _, beast in ipairs(beasts) do
+                if beast.boss then bossNames[beast.name] = true end
+            end
+        end
+        for _, name in ipairs(names) do
+            if bossNames[name] then return true end
+        end
+        return false
+    end
+
+    -- seconds a quest's tasks should take, or nil when one of them is something the farm can't do
+    local function taskTime(kit, Quests, template)
+        local Shop = kit.api("Shop")
+        local seconds = 0
+        for _, task in ipairs(template.tasks or {}) do
+            if not task.hidden then
+                if task.kind == "collect" then
+                    local nodes = task.target and nodesFor(kit, task.target) or nil
+                    local okShop, listings = false, nil
+                    if Shop and task.target then okShop, listings = Shop.find(task.target) end
+                    if nodes and toolsGather(kit, nodes) then
+                        seconds = seconds + task.max * GUESS.collect
+                    elseif okShop and type(listings) == "table" and #listings > 0 then
+                        seconds = seconds + GUESS.buy
+                    else
+                        return nil
+                    end
+                elseif task.kind == "kill" then
+                    local names = mobsFor(kit, Quests, task.target)
+                    if #names == 0 then return nil end
+                    local nightOnly = true
+                    for _, name in ipairs(names) do
+                        if not NIGHT_ONLY[name] then nightOnly = false end
+                    end
+                    if nightOnly and not isNight() then return nil end
+                    seconds = seconds + task.max * (isBoss(kit, names) and GUESS.boss or GUESS.kill)
+                elseif task.kind == "race" then
+                    seconds = seconds + GUESS.race
+                elseif task.kind == "other" and string.match(task.name or "", "^Hit ") then
+                    seconds = seconds + task.max * GUESS.hit
+                else
+                    return nil
+                end
+            end
+        end
+        return seconds
+    end
+
+    -- every repeatable the farm can do, as giver -> how much it pays a second, the best first in the list
+    local function rankQuests(kit, Quests)
+        if ranked and os.clock() - rankedAt < RANK_EVERY then return ranked.list, ranked.score end
+        local ok, list = Quests.repeatables()
+        local here = kit.position()
+        if not (ok and type(list) == "table" and here) then return {}, {} end
+        local score, givers = {}, {}
+        for _, template in ipairs(list) do
+            local seconds = not unable[template.giver] and taskTime(kit, Quests, template) or nil
+            if seconds and template.position then
+                local first = template.tasks and template.tasks[1] and template.tasks[1].position or template.position
+                local travel = (distance(here, template.position) + 2 * distance(template.position, first)) / GUESS_SPEED
+                local rewards = template.rewards or {}
+                local worth = (rewards.xp or 0) + (rewards.marks or 0) * MARK_WORTH
+                score[template.giver] = worth / (seconds + travel + GUESS.handIn)
+                givers[#givers + 1] = template.giver
+            end
+        end
+        table.sort(givers, function(a, b) return score[a] > score[b] end)
+        ranked, rankedAt = { list = givers, score = score }, os.clock()
+        return givers, score
     end
 
     local function templatesBy(Quests)
@@ -41137,7 +42937,7 @@ function M.new(cfg, shared)
     end
 
     -- the nearest picked quest that can be taken now; cooldowns are asked as they come up, never more than every RECHECK
-    local function takeNext(kit, Quests, givers, templates, holding)
+    local function takeNext(kit, Quests, givers, templates, holding, score)
         local here = kit.position()
         if not here then return end
         local now = os.clock()
@@ -41153,7 +42953,10 @@ function M.new(cfg, shared)
                 end
             end
         end
-        table.sort(options, function(a, b) return distance(here, a.position) < distance(here, b.position) end)
+        table.sort(options, function(a, b)
+            if score then return (score[a.giver] or 0) > (score[b.giver] or 0) end
+            return distance(here, a.position) < distance(here, b.position)
+        end)
         for _, template in ipairs(options) do
             local giver = template.giver
             if (askedAt[giver] or -math.huge) + RECHECK <= now then
@@ -41167,7 +42970,7 @@ function M.new(cfg, shared)
             if (readyAt[giver] or 0) <= now then
                 local model = reachGiver(kit, giver, template.position)
                 if not model then return end
-                kit.status(("Taking %s from %s."):format(template.title, giver))
+                say(kit, "Taking %s from %s.", template.title, giver)
                 local taken = Quests.accept(model)
                 if not taken then
                     skipped[giver] = os.clock() + GIVE_UP
@@ -41178,9 +42981,9 @@ function M.new(cfg, shared)
         end
         local _, setAside = next(aside)
         if soonest then
-            kit.status(("Every quest you picked is resting. The next one is ready in %s."):format(minutes(soonest - now)))
+            say(kit, "Every quest you picked is resting. The next one is ready in %s.", minutes(soonest - now))
         elseif setAside and setAside > now then
-            kit.status(("The monsters for your hunts aren't out right now. Looking again in %s."):format(minutes(setAside - now)))
+            say(kit, "The monsters for your hunts aren't out right now. Looking again in %s.", minutes(setAside - now))
         elseif next(unable) then
             local _, why = next(unable)
             kit.status(why)
@@ -41197,11 +43000,21 @@ function M.new(cfg, shared)
             kit.sleep(1)
             return
         end
-        local givers = chosenList(cfg.givers)
-        if #givers == 0 then
-            kit.status("Pick the quests to do.")
-            kit.sleep(1)
-            return
+        local givers, score = nil, nil
+        if cfg.best then
+            givers, score = rankQuests(kit, Quests)
+            if #givers == 0 then
+                kit.status("None of the quests can be done right now.")
+                kit.sleep(WAIT)
+                return
+            end
+        else
+            givers = chosenList(cfg.givers)
+            if #givers == 0 then
+                kit.status("Pick the quests to do.")
+                kit.sleep(1)
+                return
+            end
         end
         local picked = {}
         for _, giver in ipairs(givers) do picked[giver] = true end
@@ -41217,14 +43030,14 @@ function M.new(cfg, shared)
                     if quest.ready then return handIn(kit, Quests, quest, templates[quest.key]) end
                     for _, task in ipairs(quest.tasks) do
                         if not task.done and not task.hidden then
-                            kit.status(("%s: %s (%d of %d)."):format(quest.title, task.name, task.progress, task.max))
+                            say(kit, "%s: %s (%d of %d).", quest.title, task.name, task.progress, task.max)
                             return work(kit, Quests, quest, task)
                         end
                     end
                 end
             end
         end
-        return takeNext(kit, Quests, givers, templates, holding)
+        return takeNext(kit, Quests, givers, templates, holding, score)
     end
 
     return brain
@@ -41424,9 +43237,11 @@ local WAIT_GUARD  = 0.15
 local LAND_TIME   = 0.35
 -- in instakill mode a mob gone this soon after the first instakill on it was the instakill's doing; slower, it was worn down
 local EXECUTE_CREDIT = 1
--- a mob it could not kill or reach in this long is left alone for a while
-local TARGET_TIME = 90
+-- a mob it hasn't hurt in this long (out of reach, or shrugging every hit off) is left alone for a while; a long fight that is still landing hits goes on (live 2026-10-24: a 90 s cap on the whole fight walked away from Holda at 22%, and she healed)
+local TARGET_TIME = 40
 local SKIP_FOR    = 30
+-- the trip failures that mean a mob can't be reached from here
+local UNREACHABLE = { ["movement/no_path"] = true, ["movement/timed_out"] = true, ["movement/blocked"] = true }
 -- picking: each other mob this close to a candidate counts against it as this many studs, and a hurt one is worth this much nearer
 local CROWD_GAP   = 25
 local CROWD_COST  = 60
@@ -41439,6 +43254,8 @@ local PARRY_RANGE = 30
 local PUNISH_TIME = 1
 -- how long a swing keeps the character busy (live 2026-10-24: a light held State_Attacking 0.57 s; a heavy is slower), so one is only started with that long left before a strike, plus a margin
 local SWING_TIME   = { light = 0.6, heavy = 0.95 }
+-- how long a cast keeps the character busy (live 2026-10-24: Scorching Barrage held its state for several seconds of hits)
+local SKILL_TIME   = 2
 local STRIKE_SLACK = 0.12
 local HOLD_POLL    = 0.03
 
@@ -41475,6 +43292,15 @@ local function freeFor(mob, now)
     return 0
 end
 
+-- the mob is winding up or throwing an attack (live 2026-10-24: every hit a Dire Wolf landed came in its SkillActive with HyperArmor, which our hits don't interrupt, most while we were mid-combo or channelling a spell, when no parry or block can be pressed)
+local function attacking(mob)
+    local ok, on = pcall(function()
+        local model = mob.model
+        return model:GetAttribute("State_SkillActive") == true or model:GetAttribute("State_Swinging") == true
+    end)
+    return ok and on
+end
+
 local function healthShare(mob)
     local ok, share = pcall(function() return mob.humanoid.Health / math.max(mob.humanoid.MaxHealth, 1) end)
     if ok then return share end
@@ -41492,12 +43318,16 @@ end
 
 local function describe(list)
     if #list == 1 then return list[1] end
-    if #list == 2 then return list[1] .. " or " .. list[2] end
-    return "the monsters you picked"
+    return list[1] .. " or " .. list[2]
 end
 
--- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, plus locked() for the premium gate
+-- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, dodge (roll through specials), plus locked() for the premium gate, and proper (the boss farm's, whose names take no "a" or "the")
 function M.new(cfg)
+    local function called(name, article)
+        if cfg.proper then return name end
+        return article .. " " .. name
+    end
+
     -- parrying and the instakill are premium: the gate only no-ops a locked toggle's callback, so the on-by-default ones are checked here too
     local function unlocked()
         return not (type(cfg.locked) == "function" and cfg.locked())
@@ -41668,9 +43498,9 @@ function M.new(cfg)
         local Parry = kit.api("Parry")
         if not Parry then return end
         if parryOn() and not brain.parryToken then
-            local ok, token = Parry.request("Mob Farm", { range = PARRY_RANGE, block = cfg.block ~= false })
+            local ok, token = Parry.request("Mob Farm", { range = PARRY_RANGE, block = cfg.block ~= false, dodge = cfg.dodge ~= false })
             if not ok then return end
-            brain.parryToken = token
+            brain.parryToken, brain.parryDodge = token, cfg.dodge ~= false
             kit.track({ Disconnect = function()
                 if brain.parryToken == token then
                     Parry.release(token)
@@ -41680,6 +43510,9 @@ function M.new(cfg)
         elseif not parryOn() and brain.parryToken then
             Parry.release(brain.parryToken)
             brain.parryToken = nil
+        elseif brain.parryToken and brain.parryDodge ~= (cfg.dodge ~= false) then
+            brain.parryDodge = cfg.dodge ~= false
+            Parry.adjust(brain.parryToken, { dodge = brain.parryDodge })
         end
     end
 
@@ -41727,7 +43560,7 @@ function M.new(cfg)
         end
         if gap > MELEE then
             guard(kit, false)
-            kit.status(("Closing in on the %s."):format(mob.name))
+            kit.status(("Closing in on %s."):format(called(mob.name, "the")))
             kit.travel(function() return rootOf(mob) end, { reach = CHASE_REACH, broom = false, watch = function() return not alive(mob) end })
             return
         end
@@ -41735,9 +43568,9 @@ function M.new(cfg)
         if at then kit.face(at) end
         target.fought = true
         if instakillMode() then
-            kit.status(("Fighting a %s, instakilling it until it's gone."):format(mob.name))
+            kit.status(("Fighting %s, instakilling it until it's gone."):format(called(mob.name, "a")))
         else
-            kit.status(("Fighting a %s (%d%% health left)."):format(mob.name, math.floor(healthShare(mob) * 100)))
+            kit.status(("Fighting %s (%d%% health left)."):format(called(mob.name, "a"), math.floor(healthShare(mob) * 100)))
         end
         if tryExecute(kit, Combat, mob) then return end
 
@@ -41750,7 +43583,7 @@ function M.new(cfg)
             guard(kit, false)
             local due = strikeIn(kit)
             if due and due < SWING_TIME.light + STRIKE_SLACK then
-                kit.status(("Waiting to parry the %s."):format(mob.name))
+                kit.status(("Waiting to parry %s."):format(called(mob.name, "the")))
                 kit.sleep(HOLD_POLL)
                 return
             end
@@ -41761,11 +43594,18 @@ function M.new(cfg)
             -- room for a heavy: a window the mob cannot strike in, a parry just landed, or the next strike far enough off
             local free = freeFor(mob, serverNow(kit))
             if punishing then free = math.max(free, SWING_TIME.heavy) end
+            -- an attack under way is never swung into: the parry api's block or parry is all that answers it
+            if attacking(mob) and free <= 0 then
+                kit.status(("Waiting out %s's attack."):format(mob.name))
+                kit.sleep(HOLD_POLL)
+                return
+            end
             local room = math.huge
             if due then room = due - STRIKE_SLACK end
             local heavyFits = free >= SWING_TIME.heavy and room >= SWING_TIME.heavy
             local swung = false
-            if cfg.skills and (free > 0 or punishing) then swung = castReady(kit, Combat) end
+            -- a spell channels for seconds with no parry or block, so only a window that long gets one
+            if cfg.skills and (free >= SKILL_TIME or punishing) and room >= SKILL_TIME then swung = castReady(kit, Combat) end
             if not swung and cfg.heavy and heavyFits and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
             if not swung then swung = Combat.attack("light") == true end
             if swung then
@@ -41832,7 +43672,11 @@ function M.new(cfg)
                     kit.travel(home, { reach = 20 })
                     return
                 end
-                kit.status(("No %s around. Waiting for one to show up."):format(describe(names)))
+                if #names > 2 then
+                    kit.status("None of the monsters you picked are around. Waiting for one to show up.")
+                else
+                    kit.status(("No %s around. Waiting for one to show up."):format(describe(names)))
+                end
                 kit.sleep(1.5)
                 return
             end
@@ -41840,6 +43684,8 @@ function M.new(cfg)
         end
 
         local mob = target.mob
+        local share = healthShare(mob)
+        if not target.share or share < target.share - 0.005 then target.share, target.since = share, os.clock() end
         if os.clock() - target.since > TARGET_TIME then
             guard(kit, false)
             return skip(mob)
@@ -41852,9 +43698,10 @@ function M.new(cfg)
         local gap = distance(here, at)
         if gap > FIGHT_RANGE then
             guard(kit, false)
-            kit.status(("Flying to a %s (%d studs away)."):format(mob.name, math.floor(gap)))
+            kit.status(("Flying to %s (%d studs away)."):format(called(mob.name, "a"), math.floor(gap)))
             local ok, why = kit.travel(function() return rootOf(mob) end, { reach = APPROACH, watch = function() return not alive(mob) end })
-            if not ok and why ~= "stopped" and why ~= "watched" then
+            -- only a route that can't be had leaves the mob for a while; a respawn, a server teleport or a death mid-flight is just tried again (live 2026-10-24: a boss left alone for 30 s over a trip begun while the character loaded)
+            if not ok and UNREACHABLE[why] then
                 local after, now = kit.position(), rootOf(mob)
                 if after and now and distance(after, now) > FIGHT_RANGE then skip(mob) end
             end
@@ -42309,6 +44156,10 @@ local LOOK_TIME  = 6
 local RECHECK    = 90
 -- a spot is looked over from this far above it on the broom: landing at every one cost the 8 s broom cooldown on the way to the next (the user, 2026-10-24: "we keep losing our broom")
 local SPOT_HOVER = 40
+-- a boss is only left alone when the fights aren't getting anywhere (the user, 2026-10-24: don't bench a boss while we're making progress): this many deaths in a row, each with less than PROGRESS of its health taken off in that fight, rests it this long while the farm goes on with the others
+local LOSSES = 3
+local PROGRESS = 0.25
+local REST = 1200
 -- a boss's drop is looked for this close to where it fell, for this long
 local LOOT_RADIUS = 45
 local LOOT_WAIT   = 5
@@ -42362,16 +44213,61 @@ end
 -- cfg is the live settings table the menu writes (bosses, a set; loot); shared.mob is the mob farm's settings, which the fighting borrows
 function M.new(cfg, shared)
     local brain = {}
-    local mobCfg = setmetatable({ names = {} }, { __index = shared.mob })
+    local mobCfg = setmetatable({ names = {}, proper = true }, { __index = shared.mob })
     local fighter = Mobs.new(mobCfg)
     local checked, seeds = {}, nil
     local fighting = nil
     local sweep, sweepAt = nil, 1
+    -- the boss last fought (and its health share when this life took it on, and the lowest since), how many fights in a row each has won with no progress, and when a rested one comes back
+    local engaged, losses, resting, deathsSeen = nil, {}, {}, nil
+    local share = nil
 
     function brain.begin()
         checked, seeds, fighting = {}, nil, nil
         sweepAt = 1
+        engaged, losses, resting, deathsSeen, share = nil, {}, {}, nil, nil
         fighter.begin()
+    end
+
+    -- a death since the last step is charged to the boss being fought
+    local function chargeDeaths(kit)
+        local deaths = tonumber(kit.stats.deaths) or 0
+        if deathsSeen == nil then deathsSeen = deaths end
+        if deaths <= deathsSeen then return end
+        deathsSeen = deaths
+        if not engaged then return end
+        local progress = share and (share.start - share.low) or 0
+        share = nil
+        if progress >= PROGRESS then
+            losses[engaged] = 0
+            engaged = nil
+            return
+        end
+        losses[engaged] = (losses[engaged] or 0) + 1
+        if losses[engaged] >= LOSSES then
+            resting[engaged], losses[engaged] = os.clock() + REST, 0
+            kit.status(("%s keeps winning without losing much health, so it's left alone for a while."):format(engaged))
+        end
+        engaged = nil
+    end
+
+    local function healthShare(mob)
+        local ok, value = pcall(function() return mob.humanoid.Health / math.max(mob.humanoid.MaxHealth, 1) end)
+        if ok then return value end
+        return nil
+    end
+
+    local function unrested(names)
+        local now, out, back = os.clock(), {}, nil
+        for _, name in ipairs(names) do
+            local untilAt = resting[name]
+            if untilAt and untilAt > now then
+                if not back or untilAt < back then back = untilAt end
+            else
+                out[#out + 1] = name
+            end
+        end
+        return out, back
     end
 
     -- where the quests say a boss lives ("Hunt the Dire Wolf", "Eliminate Holda the Witch"), learned once
@@ -42502,10 +44398,17 @@ function M.new(cfg, shared)
     end
 
     function brain.step(kit)
-        local names = chosenList(cfg.bosses)
-        if #names == 0 then
+        chargeDeaths(kit)
+        local picked = chosenList(cfg.bosses)
+        if #picked == 0 then
             kit.status("Pick the bosses to hunt.")
             kit.sleep(1)
+            return
+        end
+        local names, back = unrested(picked)
+        if #names == 0 then
+            kit.status(("Every boss you picked is too strong for now. Trying again in %d min."):format(math.ceil(((back or os.clock()) - os.clock()) / 60)))
+            kit.sleep(5)
             return
         end
         local wanted = {}
@@ -42523,6 +44426,7 @@ function M.new(cfg, shared)
         if fighting and dead(fighting.mob) then
             kit.add("bosses")
             kit.stats.lastBoss = fighting.mob.name
+            losses[fighting.mob.name], engaged = 0, nil
             local at = fighting.at
             fighting = nil
             if cfg.loot and at then loot(kit, at) end
@@ -42537,6 +44441,10 @@ function M.new(cfg, shared)
         if current then
             fighting = fighting or { mob = current }
             if fighting.mob.model ~= current.model then fighting = { mob = current } end
+            local now = healthShare(current)
+            if engaged ~= current.name or not share then share = now and { start = now, low = now } or nil end
+            if share and now and now < share.low then share.low = now end
+            engaged = current.name
             fighting.at = rootOf(current) or fighting.at
             fighter.step(kit)
             return
@@ -43057,6 +44965,7 @@ return {
     Movement    = true,
     PlayerUtils = true,
     CloverUtils = true,
+    AutoStat    = true,
     Visuals     = true,
     Aimbot      = true,
     SilentAim   = true,
