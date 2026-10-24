@@ -17927,15 +17927,17 @@ return function(ctx)
     end
 
     box:AddToggle("APEnabled", {
+        Premium  = true,
         Text     = "Auto Parry",
         Default  = false,
         Tooltip  = "Parries monsters' attacks right as they land. It reads when an attack starts, learns how long each one takes, and gets sharper the more it sees.",
         Callback = function(on) switch(on == true) end,
-    }):AddKeyPicker("APKey", { Default = "None", Mode = "Toggle", Text = "Auto Parry", SyncToggleState = true })
+    }):AddKeyPicker("APKey", { Premium = true, Default = "None", Mode = "Toggle", Text = "Auto Parry", SyncToggleState = true })
 
     local depends = box:AddDependencyBox()
     local statsLabel = depends:AddLabel("Waiting for something to parry.", true)
     depends:AddSlider("APRange", {
+        Premium  = true,
         Text     = "Range",
         Default  = 30,
         Min      = 8,
@@ -17949,6 +17951,7 @@ return function(ctx)
         end,
     })
     depends:AddSlider("APTiming", {
+        Premium  = true,
         Text     = "Timing",
         Default  = 0,
         Min      = -150,
@@ -17959,6 +17962,7 @@ return function(ctx)
         Callback = function(value) Parry.configure({ offset = (tonumber(value) or 0) / 1000 }) end,
     })
     depends:AddToggle("APRoll", {
+        Premium  = true,
         Text     = "Roll When It Can't Parry",
         Default  = true,
         Tooltip  = "If the game won't let you parry right then (mid swing, say), rolls through the attack instead.",
@@ -17968,6 +17972,7 @@ return function(ctx)
         end,
     })
     depends:AddToggle("APBlock", {
+        Premium  = true,
         Text     = "Block What It Can't Parry",
         Default  = true,
         Tooltip  = "Holds block through attacks it hasn't learned yet (it learns their timing from the block), and through any attack it can't parry or roll.",
@@ -17977,6 +17982,7 @@ return function(ctx)
         end,
     })
     depends:AddButton({
+        Premium     = true,
         Text        = "Forget Learned Timings",
         DoubleClick = true,
         Tooltip     = "Starts learning every attack's timing from scratch.",
@@ -18361,6 +18367,7 @@ return function(ctx)
     end
 
     InstakillGroupbox:AddToggle("IK_Toggle", {
+        Premium = true,
         Text = "Instakill",
         Tooltip = "This ONLY works on mobs NOT players, and only sometimes.",
         Default = false,
@@ -18373,6 +18380,7 @@ return function(ctx)
     local IKBox = InstakillGroupbox:AddDependencyBox()
 
     IKBox:AddSlider("IK_Range", {
+        Premium = true,
         Text = "Range",
         Default = 150, Min = 10, Max = 5000, Rounding = 0,
         Suffix = " studs",
@@ -18380,6 +18388,7 @@ return function(ctx)
     })
 
     IKBox:AddSlider("IK_Threshold", {
+        Premium = true,
         Text = "Health Threshold",
         Default = 90, Min = 0, Max = 100, Rounding = 0,
         Suffix = "%",
@@ -18497,6 +18506,7 @@ return function(ctx)
     end
 
     InstakillGroupbox:AddToggle("IK_NWOViz", {
+        Premium = true,
         Text = "Network Ownership Viewer",
         Tooltip = "Outlines entities — green: you own it, red: you don't. Useful for diagnosing why kills do or don't replicate.",
         Default = false,
@@ -40142,6 +40152,7 @@ local Log       = require("Utility/Log")
 local Mount     = require("Utility/Mount")
 local Scheduler = require("Utility/Scheduler")
 local Place     = require("UI/Place")
+local Premium   = require("UI/Premium")
 local Ui        = require("Features/Clover/Gathering/Ui")
 local Bosses    = require("Features/Clover/Farm/Bosses")
 local Engine    = require("Features/Clover/Farm/Engine")
@@ -40194,7 +40205,11 @@ return function(ctx)
     local settings = {
         autoRespawn = true, stopAfterDeaths = false, maxDeaths = 3, recoverBags = true, autoSell = false, sellItems = {},
     }
-    local mobCfg = { names = {}, heavy = true, skills = true, instakill = true, instakillMode = false, block = true, parry = true }
+    -- parrying and the instakill are premium: the brain checks the gate itself, since a locked toggle that starts on keeps its value
+    local mobCfg = {
+        names = {}, heavy = true, skills = true, instakill = true, instakillMode = false, block = true, parry = true,
+        locked = Premium.isLocked,
+    }
     local nodeCfg = { items = {}, ownTools = true }
     local raceCfg = { course = DEFAULT_COURSE, speed = 250, challenge = true }
     local questCfg = { givers = {} }
@@ -40310,6 +40325,7 @@ return function(ctx)
             Callback = function(on) mobCfg.block = on == true end,
         })
         depends:AddToggle("FarmMobParry", {
+            Premium  = true,
             Text     = "Parry Attacks",
             Default  = true,
             Tooltip  = "Runs Auto Parry while the farm fights: it parries monsters' attacks right as they land, never starts a swing an attack would interrupt, and saves heavy attacks for the moments the monster can't hit back (stunned, just parried, or resting after its own attack).",
@@ -40317,12 +40333,14 @@ return function(ctx)
         })
         depends:AddLabel("Parrying learns each monster's attack timing as it fights and remembers it, so it gets better the longer you farm. An attack it hasn't seen yet is blocked the first time while it learns it.", true)
         depends:AddToggle("FarmMobInstakill", {
+            Premium  = true,
             Text     = "Instakill When Possible",
             Default  = true,
             Tooltip  = "Finishes a monster off instantly whenever one of your hits lets it. It doesn't always get the chance, so the farm keeps fighting either way.",
             Callback = function(on) mobCfg.instakill = on == true end,
         })
         depends:AddToggle("FarmMobInstakillMode", {
+            Premium  = true,
             Text     = "Instakill Mode",
             Default  = false,
             Tooltip  = "Tries the instakill on the monster you're fighting every moment it's in reach, and only counts it dead once it's really gone from the world, not when its health reads zero on your screen. It keeps fighting in the meantime. Bosses and quests use it too.",
@@ -40336,14 +40354,16 @@ return function(ctx)
     local bossPicker
     if bossBox then
         bossBox:AddToggle("FarmBosses", {
+            Premium  = true,
             Text     = BOSS_FARM,
             Default  = false,
             Tooltip  = "Hunts the bosses you pick: flies to where each one spawns, fights it, picks up what it drops, and goes round the spots while they respawn.",
             Callback = function(on) switch(BOSS_FARM, on == true) end,
-        }):AddKeyPicker("FarmBossesKey", { Default = "None", Mode = "Toggle", Text = BOSS_FARM, SyncToggleState = true })
+        }):AddKeyPicker("FarmBossesKey", { Premium = true, Default = "None", Mode = "Toggle", Text = BOSS_FARM, SyncToggleState = true })
         local depends = bossBox:AddDependencyBox()
         labels[BOSS_FARM] = depends:AddLabel("Off", true)
         bossPicker = depends:AddDropdown("FarmBossNames", {
+            Premium    = true,
             Text       = "Bosses",
             Values     = {},
             Default    = {},
@@ -40353,6 +40373,7 @@ return function(ctx)
             Callback   = function(value) bossCfg.bosses = asSet(value) end,
         })
         depends:AddToggle("FarmBossLoot", {
+            Premium  = true,
             Text     = "Pick Up Drops",
             Default  = true,
             Tooltip  = "Picks up the bag a boss drops when it dies.",
@@ -40367,14 +40388,16 @@ return function(ctx)
     local questPicker
     if questBox then
         questBox:AddToggle("FarmQuests", {
+            Premium  = true,
             Text     = QUEST_FARM,
             Default  = false,
             Tooltip  = "Takes the repeatable quests you pick from their givers, does them, and hands them in, one after another. When they're all on cooldown it waits for the next one.",
             Callback = function(on) switch(QUEST_FARM, on == true) end,
-        }):AddKeyPicker("FarmQuestsKey", { Default = "None", Mode = "Toggle", Text = QUEST_FARM, SyncToggleState = true })
+        }):AddKeyPicker("FarmQuestsKey", { Premium = true, Default = "None", Mode = "Toggle", Text = QUEST_FARM, SyncToggleState = true })
         local depends = questBox:AddDependencyBox()
         labels[QUEST_FARM] = depends:AddLabel("Off", true)
         questPicker = depends:AddDropdown("FarmQuestList", {
+            Premium    = true,
             Text       = "Quests",
             Values     = {},
             Default    = {},
@@ -41473,14 +41496,22 @@ local function describe(list)
     return "the monsters you picked"
 end
 
--- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry
+-- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, plus locked() for the premium gate
 function M.new(cfg)
+    -- parrying and the instakill are premium: the gate only no-ops a locked toggle's callback, so the on-by-default ones are checked here too
+    local function unlocked()
+        return not (type(cfg.locked) == "function" and cfg.locked())
+    end
+    local function parryOn() return cfg.parry == true and unlocked() end
+    local function instakillOn() return cfg.instakill == true and unlocked() end
+    local function instakillMode() return cfg.instakillMode == true and unlocked() end
+
     -- mobs our own instakill zeroed here, and when it first was: their health reads 0 on this client whether or not the server took it
     local zeroed = setmetatable({}, { __mode = "k" })
 
     -- in instakill mode a mob lives until its instance leaves the world (the user, 2026-10-24: judge it by the instance, not by health), so one zeroed here is fought on until it is really gone
     local function alive(mob)
-        if not cfg.instakillMode then return healthAlive(mob) end
+        if not instakillMode() then return healthAlive(mob) end
         local ok, present = pcall(function() return mob.model.Parent ~= nil and mob.root.Parent ~= nil end)
         if not ok or not present then return false end
         if zeroed[mob.model] then return true end
@@ -41520,7 +41551,7 @@ function M.new(cfg)
 
     -- the soonest strike the parry api expects, in seconds, or nil
     local function strikeIn(kit)
-        if not cfg.parry then return nil end
+        if not parryOn() then return nil end
         local Parry = kit.api("Parry")
         if not Parry then return nil end
         local ok, due = Parry.incoming()
@@ -41548,10 +41579,10 @@ function M.new(cfg)
         local here = kit.position()
         if not (World and here) then return nil end
         local living = true
-        if cfg.instakillMode then living = nil end
+        if instakillMode() then living = nil end
         local ok, list = World.mobs({ names = names, alive = living, origin = here, maxDistance = SEARCH, limit = 20 })
         if not ok or type(list) ~= "table" then return nil end
-        if cfg.instakillMode then
+        if instakillMode() then
             local kept = {}
             for _, entry in ipairs(list) do
                 if entry.alive or zeroed[entry.model] then kept[#kept + 1] = entry end
@@ -41587,7 +41618,7 @@ function M.new(cfg)
             if target.fought then
                 kit.add("kills")
                 local first = zeroed[target.mob.model]
-                if cfg.instakillMode and type(first) == "number" and os.clock() - first <= EXECUTE_CREDIT then kit.add("executes") end
+                if instakillMode() and type(first) == "number" and os.clock() - first <= EXECUTE_CREDIT then kit.add("executes") end
             end
             target = nil
         end
@@ -41595,11 +41626,11 @@ function M.new(cfg)
 
     -- the instakill, every frame it is in reach: in instakill mode tried whatever ownership says and judged later by the instance leaving; otherwise only on a mob the server has handed over, judged at once
     local function tryExecute(kit, Combat, mob)
-        if cfg.instakillMode then
+        if instakillMode() then
             if Combat.execute(mob.model, { force = true }) == true and not zeroed[mob.model] then zeroed[mob.model] = os.clock() end
             return false
         end
-        if cfg.instakill and Combat.execute(mob.model) == true and not alive(mob) then
+        if instakillOn() and Combat.execute(mob.model) == true and not alive(mob) then
             kit.add("executes")
             return true
         end
@@ -41636,7 +41667,7 @@ function M.new(cfg)
     local function syncParry(kit)
         local Parry = kit.api("Parry")
         if not Parry then return end
-        if cfg.parry and not brain.parryToken then
+        if parryOn() and not brain.parryToken then
             local ok, token = Parry.request("Mob Farm", { range = PARRY_RANGE, block = cfg.block ~= false })
             if not ok then return end
             brain.parryToken = token
@@ -41646,7 +41677,7 @@ function M.new(cfg)
                     brain.parryToken = nil
                 end
             end })
-        elseif not cfg.parry and brain.parryToken then
+        elseif not parryOn() and brain.parryToken then
             Parry.release(brain.parryToken)
             brain.parryToken = nil
         end
@@ -41703,7 +41734,7 @@ function M.new(cfg)
         local at = rootOf(mob)
         if at then kit.face(at) end
         target.fought = true
-        if cfg.instakillMode then
+        if instakillMode() then
             kit.status(("Fighting a %s, instakilling it until it's gone."):format(mob.name))
         else
             kit.status(("Fighting a %s (%d%% health left)."):format(mob.name, math.floor(healthShare(mob) * 100)))
@@ -41715,7 +41746,7 @@ function M.new(cfg)
         if punishing then target.swings = 0 end
 
         -- with parrying on, the parry api owns the defence: nothing is started that a strike due before it finishes would catch
-        if cfg.parry then
+        if parryOn() then
             guard(kit, false)
             local due = strikeIn(kit)
             if due and due < SWING_TIME.light + STRIKE_SLACK then
