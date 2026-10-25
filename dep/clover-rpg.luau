@@ -17240,13 +17240,14 @@ end
 
 end)
 __bundle_register("Features/Clover/PlayerUtils", function(require, _LOADED, __bundle_register, __bundle_modules)
--- clover utils orchestrator: one box built through UI/Place holding the clover-only player toggles (no fall damage, no slowdown, anti knockback, no dash cooldown, no slide cooldown, air dash), so the tab file decides where it goes
+-- clover utils orchestrator: one box built through UI/Place holding the clover-only player toggles (no fall damage, no slowdown, anti knockback, no dash cooldown, no slide cooldown, air dash, noclip), so the tab file decides where it goes
 local Mount           = require("Utility/Mount")
 local Place           = require("UI/Place")
 local AirDash         = require("Features/Clover/PlayerUtils/AirDash")
 local AntiKnockback   = require("Features/Clover/PlayerUtils/AntiKnockback")
 local NoDashCooldown  = require("Features/Clover/PlayerUtils/NoDashCooldown")
 local NoFallDamage    = require("Features/Clover/PlayerUtils/NoFallDamage")
+local Noclip          = require("Features/Clover/PlayerUtils/Noclip")
 local NoSlideCooldown = require("Features/Clover/PlayerUtils/NoSlideCooldown")
 local NoSlowdown      = require("Features/Clover/PlayerUtils/NoSlowdown")
 
@@ -17264,6 +17265,7 @@ return function(ctx)
         O.mount(NoDashCooldown, uCtx)
         O.mount(NoSlideCooldown, uCtx)
         O.mount(AirDash, uCtx)
+        O.mount(Noclip, uCtx)
     end
 
     O.finalize()
@@ -17619,6 +17621,31 @@ return function(ctx)
 end
 
 end)
+__bundle_register("Features/Clover/PlayerUtils/Noclip", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- noclip sub-module of clover utils: switches your own character's collision off through the shared refcounted noclip helper, so you don't catch on ledges, mobs or players; the server rewinds a walk fully through a wall (live 2026-10-24), which no client change gets around
+return function(ctx)
+    local Helpers = ctx.Helpers
+    local usable = type(Helpers) == "table" and type(Helpers.startNoclip) == "function" and type(Helpers.stopNoclip) == "function"
+    local on = false
+
+    local function set(value)
+        value = value == true
+        if value == on or not usable then return end
+        on = value
+        if on then pcall(Helpers.startNoclip) else pcall(Helpers.stopNoclip) end
+    end
+
+    ctx.CloverGroup:AddToggle("CloverNoclip", {
+        Text     = "Noclip",
+        Default  = false,
+        Tooltip  = "Turns your character's collision off so you stop getting stuck on things. Walking all the way through a wall still gets you pulled back by the game a second later.",
+        Callback = set,
+    }):AddKeyPicker("CloverNoclipKey", { Default = "None", Mode = "Toggle", Text = "Noclip", SyncToggleState = true })
+
+    return { cleanup = function() set(false) end }
+end
+
+end)
 __bundle_register("Features/Clover/PlayerUtils/NoFallDamage", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- no fall damage sub-module of clover utils: holds the character's DisableFallDamage attribute on, the switch the game's own FallDamage script checks before it reports a landing
 local AttributeHold = require("Features/Clover/PlayerUtils/AttributeHold")
@@ -17897,16 +17924,23 @@ local BUILDS = {
       goals = { Vitality = 50, Endurance = 50, Strength = 30, Agility = 30 } },
     { name = "Evasion", order = { "Agility", "Vitality", "Strength", "Endurance" },
       goals = { Agility = 50, Vitality = 40, Strength = 40, Endurance = 30 } },
-    { name = "Mage", order = { "Magic Power", "Intelligence", "Vitality", "Endurance" },
-      goals = { ["Magic Power"] = 50, Intelligence = 40, Vitality = 40, Endurance = 30 } },
+    -- magic power is the only stat behind spell damage; vitality 50 opens the low-health traits, intelligence 20+ potion savant, endurance 20 and strength 10 strong core and survivor's fury
+    { name = "Mage", order = { "Magic Power", "Vitality", "Intelligence", "Endurance", "Strength" },
+      goals = { ["Magic Power"] = 50, Vitality = 50, Intelligence = 30, Endurance = 20, Strength = 10 } },
 }
 local DEFAULT_BUILD = "Fighter"
 -- the traits worth having for fighting monsters and farming, best first; every other trait follows in name order, off until picked
+-- glass cannon is left out: its pierce is intelligence minus vitality, so it's worthless on any build that lives through a boss
 local TRAIT_ORDER = {
-    "Weapons Expert", "Mob Slayer", "Rapid Recovery", "Pick-Me-Up", "Bargain Master", "Tempered Body", "Pacifist",
-    "Reinforced Blade", "Survivor's Fury", "Hyper Adrenaline", "Strong Core", "Iron Rebound", "Unyielding Bastion",
-    "Panic Attack", "Steadfast", "Tailwind", "Liver Shot", "Overflow", "Lucky Miner", "Exhaustion Blow", "Spellguard",
-    "Pack Mule", "Graceful Escape", "Deceptive Momentum", "Critical Aerial", "Exhaustion Strike", "Sixth Sense",
+    "Weapons Expert", "Mob Slayer", "Survivor's Fury", "Hyper Adrenaline",
+    -- the damage passives of each magic; only your own magic's show up
+    "Amplified Wrath", "Shattering Ember", "Stormcaller's Respite", "Rain Dancer", "Fear The Shadows", "Focused Beam",
+    "Blade Storm", "Aerial Efficiency", "Temporal Overflow",
+    "Rapid Recovery", "Strong Core", "Iron Rebound",
+    "Unyielding Bastion", "Dirty Casting", "Potion Savant", "Arcane Rebound", "Tempered Body", "Spellguard", "Pick-Me-Up",
+    "Bargain Master", "Pacifist", "Reinforced Blade", "Panic Attack", "Steadfast", "Tailwind", "Liver Shot", "Overflow",
+    "Lucky Miner", "Exhaustion Blow", "Pack Mule", "Graceful Escape", "Deceptive Momentum", "Critical Aerial",
+    "Exhaustion Strike", "Sixth Sense",
 }
 -- what's coming up is listed this many deep
 local UPCOMING = 2
@@ -20427,6 +20461,8 @@ local LOADERS = {
     { name = "Stats",   load = function() return require("Api/Stats") end },
     -- after State, whose death signal it times the respawn screen from
     { name = "Respawn", load = function() return require("Api/Respawn") end },
+    -- your save slots and the trip between the menu place and World, through CloverNet
+    { name = "Slots",   load = function() return require("Api/Slots") end },
     -- races are flown by features through Movement; the api only talks to the race server
     { name = "Racing",  load = function() return require("Api/Racing") end },
     -- after Combat, whose parry, roll and block it presses, and World, whose mobs it watches
@@ -26375,6 +26411,219 @@ return {
 }
 
 end)
+__bundle_register("Api/Slots", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- slots api: your save slots and the trip between the menu place and World, each the way the game's own menu does it (.tools/recon/menu_place.md): the slot list and each slot's data, wiping and loading a slot, naming a blank one and joining World from the menu, going back to the menu from World, and getting past World's press-any-button screen; shared as ctx.Api.Slots
+local Services   = require("Services")
+local References = require("References")
+local Api        = require("Api")
+local Errors     = require("Api/Slots/Errors")
+
+local MENU, WORLD = 8248164019, 8248288152
+local ANSWER_WAIT = 15
+-- SetSlot answers first, the DressedSlot attribute turns a moment later (live: under 4 s)
+local DRESS_WAIT = 10
+local NAME_WAIT = 3
+local POLL = 0.1
+
+local M = {}
+
+M.MENU, M.WORLD = MENU, WORLD
+
+function M.new(ctx)
+    local base = Api.define("Slots", ctx)
+    local api = { Errors = Errors, MENU = MENU, WORLD = WORLD }
+    local closed = false
+
+    local function net()
+        local found = ctx.Api and ctx.Api.CloverNet
+        if type(found) == "table" then return found end
+        return nil
+    end
+
+    local function settle(label, ok, ...)
+        if ok then return ... end
+        base.warn("%s threw: %s", label, tostring((...)))
+        return false, Errors.NOT_READY
+    end
+
+    local function expose(name, fn)
+        local label = "Slots." .. name
+        api[name] = function(...)
+            if closed then return false, Errors.NOT_READY end
+            return settle(label, pcall(fn, ...))
+        end
+    end
+
+    local function placeName()
+        if game.PlaceId == MENU then return "menu" end
+        if game.PlaceId == WORLD then return "world" end
+        return "other"
+    end
+
+    local function call(path, ...)
+        local n = net()
+        if not n then return false, Errors.NOT_READY end
+        local ok, answer = n.callWith(path, { timeout = ANSWER_WAIT }, ...)
+        if not ok then return false, Errors.NO_ANSWER, answer end
+        return true, answer
+    end
+
+    local function validSlot(slot)
+        return type(slot) == "number" and slot >= 1 and slot % 1 == 0
+    end
+
+    local function wait(seconds, done)
+        local limit = os.clock() + seconds
+        while not done() do
+            if os.clock() > limit or closed then return false end
+            task.wait(POLL)
+        end
+        return true
+    end
+
+    expose("place", function()
+        return true, placeName()
+    end)
+
+    -- the slot this character was loaded from, in either place
+    expose("current", function()
+        local player = References.player
+        local slot = player:GetAttribute("LoadedSlot") or player:GetAttribute("DressedSlot")
+        if type(slot) ~= "number" then return false, Errors.NOT_READY end
+        return true, slot
+    end)
+
+    -- Initialize.lua:141, Handle.lua:394: { [i] = "Slot<i>" } for every slot made
+    expose("slots", function()
+        if placeName() ~= "menu" then return false, Errors.WRONG_PLACE end
+        local ok, answer = call("RequestCreatedSlots", "GetSlots")
+        if not ok then return false, answer end
+        local out = {}
+        if type(answer) == "table" then
+            for key in pairs(answer) do
+                if type(key) == "number" then out[#out + 1] = key end
+            end
+        end
+        table.sort(out)
+        return true, out
+    end)
+
+    -- Handle.lua:130: the level, magic and name a slot holds
+    expose("slotData", function(slot)
+        if placeName() ~= "menu" then return false, Errors.WRONG_PLACE end
+        if not validSlot(slot) then return false, Errors.BAD_ARGS end
+        local ok, answer = call("DataRequest", "RetrieveSlotData", slot)
+        if not ok then return false, answer end
+        if type(answer) ~= "table" or type(answer.Data) ~= "table" then return false, Errors.NO_ANSWER end
+        local player = type(answer.Data.PlayerData) == "table" and answer.Data.PlayerData or {}
+        local custom = type(answer.Data.CustomizeData) == "table" and answer.Data.CustomizeData or {}
+        return true, {
+            level  = tonumber(player.Level) or 0,
+            magic  = type(player.Magic) == "string" and player.Magic or "None",
+            name   = type(custom.CharacterName) == "string" and custom.CharacterName or "",
+            race   = type(custom.Race) == "string" and custom.Race or "",
+            locked = answer.SlotLocked == true,
+        }
+    end)
+
+    -- Handle.lua:321: the delete button's confirm; keepMagic is its "keep magic" box (only offered when the slot has magic)
+    expose("wipe", function(slot, keepMagic)
+        if placeName() ~= "menu" then return false, Errors.WRONG_PLACE end
+        if not validSlot(slot) then return false, Errors.BAD_ARGS end
+        local ok, answer = call("Wipe", slot, keepMagic == true)
+        if not ok then return false, answer end
+        if not answer then return false, Errors.REFUSED end
+        return true
+    end)
+
+    -- Handle.lua:692: the slot's load button; the server dresses the slot (DressedSlot) a moment after answering
+    expose("load", function(slot)
+        if placeName() ~= "menu" then return false, Errors.WRONG_PLACE end
+        if not validSlot(slot) then return false, Errors.BAD_ARGS end
+        local ok, answer = call("DataRequest", "SetSlot", slot)
+        if not ok then return false, answer end
+        if not answer then return false, Errors.REFUSED end
+        local player = References.player
+        if not wait(DRESS_WAIT, function() return player:GetAttribute("DressedSlot") == slot end) then return false, Errors.TIMED_OUT end
+        return true
+    end)
+
+    -- NameSelection.lua:98-116: a blank first name gets the game's own random pick, as the customize screen does when it opens
+    expose("name", function()
+        if placeName() ~= "menu" then return false, Errors.WRONG_PLACE end
+        local player = References.player
+        local folder = player:FindFirstChild("CustomizeFolder")
+        local value = folder and folder:FindFirstChild("CharacterName")
+        if value == nil then return false, Errors.NOT_READY end
+        if value.Value ~= "" then return true, value.Value end
+        local modules = Services.ReplicatedStorage:FindFirstChild("Modules")
+        local namesModule = modules and modules:FindFirstChild("Names")
+        if namesModule == nil then return false, Errors.NOT_READY end
+        local okNames, Names = pcall(require, namesModule)
+        if not okNames or type(Names) ~= "table" or type(Names.GiveName) ~= "function" then return false, Errors.NOT_READY end
+        local n = net()
+        if not n then return false, Errors.NOT_READY end
+        local okFire = n.fire("NameSelection", Names:GiveName(player))
+        if not okFire then return false, Errors.NO_ANSWER end
+        if not wait(NAME_WAIT, function() return value.Value ~= "" end) then return false, Errors.TIMED_OUT end
+        return true, value.Value
+    end)
+
+    -- ServerListClient.lua:336: the server list's quick join
+    expose("joinWorld", function()
+        if placeName() ~= "menu" then return false, Errors.WRONG_PLACE end
+        local ok, answer = call("Teleport", "World", nil, nil)
+        if not ok then return false, answer end
+        if not answer then return false, Errors.REFUSED end
+        return true
+    end)
+
+    -- Permanent.Window.Return.Client.lua:31: the menu's return button
+    expose("toMenu", function()
+        if placeName() ~= "world" then return false, Errors.WRONG_PLACE end
+        local ok, answer = call("RequestReturn")
+        if not ok then return false, answer end
+        if not answer then return false, Errors.REFUSED end
+        return true
+    end)
+
+    -- Initialize.lua: World waits for any key before it asks the server to spawn you (ReplicatedStorage.Loaded); a key press is sent the way a player would, so the game's own screen goes on
+    expose("pressToContinue", function()
+        local player = References.player
+        if player:GetAttribute("Loaded") then return true end
+        local vim = Services.VirtualInputManager
+        local function press(down)
+            if setthreadidentity then pcall(setthreadidentity, 8) end
+            vim:SendKeyEvent(down, Enum.KeyCode.Space, false, game)
+        end
+        pcall(press, true)
+        task.wait(0.1)
+        pcall(press, false)
+        if not wait(NAME_WAIT * 3, function() return player:GetAttribute("Loaded") == true end) then return false, Errors.TIMED_OUT end
+        return true
+    end)
+
+    if base.maid then base.maid:GiveTask(function() closed = true end) end
+
+    return api
+end
+
+return M
+
+end)
+__bundle_register("Api/Slots/Errors", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- slots errors: the string codes every slots verb returns as its failure result
+
+return {
+    NOT_READY  = "slots/not_ready",
+    BAD_ARGS   = "slots/bad_args",
+    WRONG_PLACE = "slots/wrong_place",
+    NO_ANSWER  = "slots/no_answer",
+    REFUSED    = "slots/refused",
+    TIMED_OUT  = "slots/timed_out",
+}
+
+end)
 __bundle_register("Api/Respawn", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- respawn api: brings a dead character back the way the respawn screen does (RespawnClient.lua:23-50), at the nearest unlocked shrine of the region when the screen would offer one, the mission's own spawn inside a mission and the inn otherwise, only once the screen itself has opened; afterwards it puts back anything the screen left behind (its scriptable camera hovering over the spawn, the overlay, and the streaming focus on the spawn point, live 2026-10-24, which kept the world from streaming in round the character); shared as ctx.Api.Respawn
 local References = require("References")
@@ -26847,8 +27096,18 @@ function M.new(ctx)
         end
         local marks = tonumber(required.Marks) or 0
         if marks > 0 and (tonumber(folder:GetAttribute("Marks")) or 0) < marks then missing[#missing + 1] = ("%d Marks"):format(marks) end
+        local insight = tonumber(required.Insight) or 0
+        if insight > 0 and (tonumber(folder:GetAttribute("Insight")) or 0) < insight then missing[#missing + 1] = ("%d Insight"):format(insight) end
         table.sort(missing)
         return missing, tonumber(required.Points) or 0, marks
+    end
+
+    -- FlameInfo.lua:82-136: a magic's passives are Type "Magic" with Skillset "<magic> Passive", sold by its grimoire echo in the inner realm, yet the same UnlockTrainer call learns them from anywhere (live 2026-10-25); only your own magic's count
+    local function learnable(def, folder)
+        if def.Type == "Trait" then return true end
+        if def.Type ~= "Magic" or def.ReqType ~= "Trainer" then return false end
+        local magic = folder:GetAttribute("Magic")
+        return type(magic) == "string" and magic ~= "" and def.Skillset == magic .. " Passive"
     end
 
     -- (true, list) every trait the game has: { name, class, description, points, marks, owned, ready (every requirement met), missing (what isn't, in plain words) }
@@ -26860,11 +27119,11 @@ function M.new(ctx)
         if not (defs and skills and folder) then return false, Errors.NOT_READY end
         local out = {}
         for name, def in pairs(defs) do
-            if type(name) == "string" and type(def) == "table" and def.Type == "Trait" then
+            if type(name) == "string" and type(def) == "table" and learnable(def, folder) then
                 local missing, points, marks = requirementsOf(def, player, skills, folder)
                 out[#out + 1] = {
                     name        = name,
-                    class       = def.Class,
+                    class       = def.Type == "Magic" and "Magic Passive" or def.Class,
                     description = type(def.Description) == "string" and def.Description or "",
                     points      = points,
                     marks       = marks,
@@ -26900,7 +27159,7 @@ function M.new(ctx)
         local folder = player and player:FindFirstChild("PlayerFolder")
         if not (defs and net and skills and folder) then return false, Errors.NOT_READY end
         local def = defs[name]
-        if type(def) ~= "table" or def.Type ~= "Trait" then return false, Errors.BAD_ARGS end
+        if type(def) ~= "table" or not learnable(def, folder) then return false, Errors.BAD_ARGS end
         if skills:FindFirstChild(name) then return true end
         local missing, points = requirementsOf(def, player, skills, folder)
         if #missing > 0 then return false, Errors.NOT_MET, missing end
@@ -27611,6 +27870,8 @@ local Api        = require("Api")
 local Errors     = require("Api/Quests/Errors")
 
 local ACCEPT, COMPLETE, COOLDOWN = "NPC", "Client/UpdateQuestLog", "QuestCooldown"
+-- DialogueManager.Actions.AcceptQuestObject: an object dialogue's take button
+local ACCEPT_OBJECT = "ChatObject"
 local ANSWER_WAIT = 4
 local POLL = 0.1
 -- the verb a kill task's name starts with, stripped to leave the monster (Javier's "Defeat Nightcharmers", Skadi's "Hunt the Dire Wolf")
@@ -27908,6 +28169,51 @@ function M.new(ctx)
         return true, readQuest(folder:FindFirstChild(key))
     end)
 
+    -- the take-a-quest choice somewhere in a dialogue tree the server sent: AcceptQuestObject (an object dialogue) or AcceptQuest, or nil
+    local function offered(info)
+        if type(info) ~= "table" or type(info.nodes) ~= "table" then return nil end
+        for _, node in pairs(info.nodes) do
+            if type(node) == "table" and type(node.choices) == "table" then
+                for _, choice in pairs(node.choices) do
+                    if type(choice) == "table" and (choice.action == "AcceptQuestObject" or choice.action == "AcceptQuest") then return choice.action end
+                end
+            end
+        end
+        return nil
+    end
+
+    -- takes the quest an open dialogue offers, by that choice's own call (AcceptQuestObject.lua: ChatObject(owner); AcceptQuest.lua: NPC("Quest", owner)), without clicking through it (live 2026-10-25: the starter npcs Eira and Johan send their whole tree as an object dialogue); answers the quest it took
+    expose("acceptFrom", function(session)
+        if type(session) ~= "table" or typeof(session.owner) ~= "Instance" then return false, Errors.BAD_ARGS end
+        if not coroutine.isyieldable() then return false, Errors.BAD_ARGS end
+        local folder = questsFolder()
+        local remote = net()
+        if not (folder and remote) then return false, Errors.NOT_READY end
+        local action = offered(session.info)
+        if action == nil then return false, Errors.NOT_OFFERED end
+        local before = {}
+        for _, child in ipairs(folder:GetChildren()) do before[child] = true end
+        local ok, code
+        if action == "AcceptQuestObject" then
+            ok, code = remote.fire(ACCEPT_OBJECT, session.owner)
+        else
+            ok, code = remote.fire(ACCEPT, "Quest", session.owner)
+        end
+        if not ok then return false, Errors.FAILED, code end
+        local taken = nil
+        waitFor(function()
+            for _, child in ipairs(folder:GetChildren()) do
+                if not before[child] and child:GetAttribute("Completed") ~= true then
+                    taken = child
+                    return true
+                end
+            end
+            return false
+        end)
+        if not taken then return false, Errors.NO_ANSWER end
+        return true, readQuest(taken)
+    end)
+
     -- hands in a quest whose tasks are all done (a repeatable one's folder goes, a one-time one is marked Completed)
     expose("turnIn", function(key)
         if type(key) ~= "string" or key == "" then return false, Errors.BAD_ARGS end
@@ -27948,6 +28254,7 @@ return {
     NO_QUEST  = "quests/no_quest",
     NO_ANSWER = "quests/no_answer",
     FAILED    = "quests/failed",
+    NOT_OFFERED = "quests/not_offered",
 }
 
 end)
@@ -29337,13 +29644,47 @@ function M.new(env)
         return cached
     end
 
-    local function describe(record, info, now, distance)
+    -- the streamed models the server has marked gathered (Gathered/Hidden plus a RespawnAt), read once per list; the record's own Available stays true for these (live 2026-10-25), so a farm that trusted it stood at an emptied crop forever
+    local function gatheredModels(now)
+        local out = {}
+        local root = harvestable()
+        if root == nil then return out end
+        for _, spec in pairs(KINDS) do
+            local folder = child(root, spec.folder)
+            if folder ~= nil then
+                for _, candidate in ipairs(folder:GetChildren()) do
+                    if candidate:GetAttribute("Gathered") == true or candidate:GetAttribute("Hidden") == true then
+                        local at = candidate:GetAttribute("RespawnAt")
+                        if type(at) ~= "number" or type(now) ~= "number" or at > now then
+                            local part = candidate:IsA("Model") and modelPart(candidate) or nil
+                            if part ~= nil then
+                                out[#out + 1] = { name = candidate.Name, position = part.Position, respawnAt = type(at) == "number" and at or nil }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return out
+    end
+
+    local function gatheredAt(gathered, info)
+        for _, entry in ipairs(gathered) do
+            if entry.name == info.item and VMath.distanceSqr3(entry.position, info.position) <= MODEL_RADIUS_SQ then return entry end
+        end
+        return nil
+    end
+
+    local function describe(record, info, now, distance, gathered)
         -- TrackerClient.lua:1086: only an explicit false is depleted
         local available = record:GetAttribute("Available") ~= false
         local respawnIn = 0
         if not available then
             local at = record:GetAttribute("RespawnAt")
             if type(at) == "number" and type(now) == "number" and at > now then respawnIn = at - now end
+        elseif gathered ~= nil then
+            available = false
+            if gathered.respawnAt and type(now) == "number" and gathered.respawnAt > now then respawnIn = gathered.respawnAt - now end
         end
         return {
             record    = record,
@@ -29365,6 +29706,7 @@ function M.new(env)
         local out, best = {}, nil
         local nearestOnly = filter.origin ~= nil and filter.limit == 1
         local maxSq = filter.maxDistance and filter.maxDistance * filter.maxDistance
+        local gathered = gatheredModels(now)
         for _, record in ipairs(folder:GetChildren()) do
             local info = static(record)
             if info ~= nil
@@ -29374,12 +29716,13 @@ function M.new(env)
                 local distSq
                 if filter.origin then distSq = VMath.distanceSqr3(info.position, filter.origin) end
                 if (maxSq == nil or distSq <= maxSq) and (not nearestOnly or best == nil or distSq < best.distSq) then
+                    local emptied = #gathered > 0 and gatheredAt(gathered, info) or nil
                     local wanted = true
                     if filter.available ~= nil then
-                        wanted = (record:GetAttribute("Available") ~= false) == filter.available
+                        wanted = (record:GetAttribute("Available") ~= false and emptied == nil) == filter.available
                     end
                     if wanted then
-                        local node = describe(record, info, now, distSq and math.sqrt(distSq))
+                        local node = describe(record, info, now, distSq and math.sqrt(distSq), emptied)
                         if nearestOnly then
                             best = { node = node, distSq = distSq }
                         else
@@ -29586,7 +29929,22 @@ end
 
 function M.new(env, solver, nodes)
     local self = {}
-    local running = false
+    -- the gather in flight: its thread, solver hold and watcher; a caller cancelled mid-gather (a farm switched off) never reaches its own cleanup, so the next gather does it once that thread is dead
+    local running = nil
+
+    local function letGo(run)
+        if run.watcher then solver.unwatch(run.watcher) end
+        if run.release then solver.releaseAfter(run.minigame, run.release) end
+        run.watcher, run.release = nil, nil
+    end
+
+    local function busy()
+        if running == nil then return false end
+        if coroutine.status(running.thread) ~= "dead" then return true end
+        letGo(running)
+        running = nil
+        return false
+    end
 
     local function interactCode(interact, code)
         local codes = interact.Errors
@@ -29659,7 +30017,7 @@ function M.new(env, solver, nodes)
         if info == nil then return false, Errors.BAD_ARGS end
         if not coroutine.isyieldable() then return false, Errors.FAILED, "the calling thread cannot yield" end
         local minigame = MINIGAMES[info.kind]
-        if running or solver.isOpen(minigame) then return false, Errors.BUSY end
+        if busy() or solver.isOpen(minigame) then return false, Errors.BUSY end
         if model == nil then return false, Errors.NOT_STREAMED end
         local interact = env.api("Interact")
         if interact == nil or type(interact.prompt) ~= "function" then return false, Errors.FAILED, "no interact api" end
@@ -29671,12 +30029,12 @@ function M.new(env, solver, nodes)
         end
         local release, holdWhy = solver.hold(minigame)
         if release == nil then return false, Errors.FAILED, holdWhy end
-        running = true
         local watcher = solver.watch(minigame)
+        local run = { thread = coroutine.running(), minigame = minigame, release = release, watcher = watcher }
+        running = run
         local ok, a, b, c, d = pcall(drive, interact, prompt, minigame, timeout, watcher)
-        solver.unwatch(watcher)
-        running = false
-        solver.releaseAfter(minigame, release)
+        letGo(run)
+        if running == run then running = nil end
         if not ok then
             env.base.warn("gather threw: %s", tostring(a))
             return false, Errors.FAILED
@@ -30912,12 +31270,15 @@ end)
 __bundle_register("Api/Movement", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- movement api: the only sanctioned way this fork moves the character, a tween along swept-clear air and pathfinding routes that rides the game's own broom when it can, with one owner at a time; shared as ctx.Api.Movement
 
+local Scheduler = require("Utility/Scheduler")
 local Api    = require("Api")
 local Errors = require("Api/Movement/Errors")
+local Hazards = require("Api/Movement/Hazards")
 local Probe  = require("Api/Movement/Probe")
 local Steer  = require("Api/Movement/Steer")
 local Trip   = require("Api/Movement/Trip")
 local Tuning = require("Api/Movement/Tuning")
+local Ways   = require("Api/Movement/Ways")
 
 local M = {}
 
@@ -30947,6 +31308,9 @@ function M.new(ctx)
     local idleRig = nil
     local speedSetting = Tuning.defaultSpeed
     local broomSetting = Tuning.broom
+    local noclipSetting = Tuning.noclip
+    -- the trip holding the shared noclip helper, if any; one hold at a time, let go when that trip ends
+    local noclipBy = nil
     -- shared by every trip: whether this executor's isnetworkowner has ever been seen to answer true
     local ownership = { trusted = false, distrusted = false }
 
@@ -30983,7 +31347,70 @@ function M.new(ctx)
         return facade
     end
 
+    local function helpers()
+        local found = ctx.Helpers
+        if type(found) == "table" and type(found.startNoclip) == "function" and type(found.stopNoclip) == "function" then return found end
+        return nil
+    end
+
+    -- a trip that replaces another takes its hold over, since the old one's finish may land after the new one starts
+    local function holdNoclip(control)
+        if not noclipSetting then return end
+        if noclipBy ~= nil then
+            noclipBy = control
+            return
+        end
+        local h = helpers()
+        if not h then return end
+        if base.safe("noclip on", h.startNoclip) then noclipBy = control end
+    end
+
+    local function dropNoclip(control)
+        if noclipBy == nil or (control ~= nil and noclipBy ~= control) then return end
+        noclipBy = nil
+        local h = helpers()
+        if h then base.safe("noclip off", h.stopNoclip) end
+    end
+
+    -- where the root has been lately, oldest first: a start nothing plans out of (a hollow under the mushroom canopy, a den) is left the way it was come in by; a jump no flight makes (a respawn, a server move, a rewind) starts it afresh
+    local trail = {}
+    local lastSample = nil
+    local function record()
+        local state = State()
+        local okRoot, root = false, nil
+        if state then okRoot, root = state.root() end
+        if not okRoot or typeof(root) ~= "Instance" then
+            table.clear(trail)
+            lastSample = nil
+            return
+        end
+        local here = root.Position
+        if lastSample and (here - lastSample).Magnitude > Tuning.trailJump then table.clear(trail) end
+        lastSample = here
+        local newest = trail[#trail]
+        if not newest or (here - newest).Magnitude >= Tuning.trailStep then
+            trail[#trail + 1] = here
+            if #trail > Tuning.trailMax then table.remove(trail, 1) end
+        end
+    end
+    local function trailCopy()
+        return table.clone(trail)
+    end
+    local recorder = Scheduler.heartbeat(record, { name = "Movement.trail", interval = Tuning.trailEvery })
+    if recorder and base.maid then base.maid:GiveTask(recorder) end
+
+    -- the parts that kill on touch, watched as they stream so every sweep keeps clear of them
+    if base.maid then
+        base.safe("hazard index", Hazards.start, function(connection) base.maid:GiveTask(connection) end)
+        base.maid:GiveTask(Hazards.stop)
+    end
+
+    -- a trip can end inside Trip.new (its driver runs at once), before it is made the active one; it's never made active after that
+    local ended = setmetatable({}, { __mode = "k" })
+
     local function onFinish(control, ok, reason, goal)
+        ended[control] = true
+        dropNoclip(control)
         if active == control then active = nil end
         if type(control.onDone) == "function" then base.safe("onDone", control.onDone, ok, reason) end
         if ok then
@@ -31079,6 +31506,32 @@ function M.new(ctx)
         if active then active.abort(Errors.CANCELLED) end
         local rides = (opts.broom == nil and broomSetting) or opts.broom == true or opts.air == true
         if not rides then dropIdle() end
+        -- a goal inside a place with one way in (a cave) is reached by that way, and left by it; the deadline allows for the whole way, not just its first point
+        local function rootPosition()
+            local okRoot, root = state.root()
+            if okRoot and typeof(root) == "Instance" then return root.Position end
+            return nil
+        end
+        local covered, known = nil, nil
+        do
+            local okChar, char = state.character()
+            local okHum, humanoid = state.humanoid()
+            local okRoot, root = state.root()
+            if okChar and okHum and okRoot then
+                local probe = Probe.new(char, Probe.standHeight(char, humanoid, root), base.warn)
+                covered = probe.covered
+                known = function(position)
+                    return probe.floor(position.X, position.Z, position.Y + Tuning.wayKnownUp, Tuning.wayKnownUp + Tuning.wayKnownDown) ~= nil
+                end
+            end
+        end
+        local timeout = opts.timeout
+        local startAt, realGoal = rootPosition(), resolve()
+        if timeout == nil and startAt and realGoal and Ways.route(startAt, realGoal, nil, covered, known) then
+            local pace = math.min(clampSpeed(opts.speed or speedSetting), Tuning.placeSpeed)
+            timeout = Ways.length(startAt, realGoal, nil, covered, known) / pace * Tuning.timeoutFactor + Tuning.timeoutSlack
+        end
+        resolve = Ways.through(resolve, rootPosition, nil, opts.reach or Tuning.reach, covered, known)
 
         local handle, control = Trip.new({
             base           = base,
@@ -31090,7 +31543,7 @@ function M.new(ctx)
             ownership      = ownership,
             speed          = clampSpeed(opts.speed or speedSetting),
             reach          = opts.reach or Tuning.reach,
-            timeout        = opts.timeout,
+            timeout        = timeout,
             maxCorrections = math.floor(opts.maxCorrections or Tuning.maxCorrections),
             broom          = rides,
             air            = opts.air == true,
@@ -31098,9 +31551,13 @@ function M.new(ctx)
             keep           = keep,
             onFinish       = onFinish,
             onCorrected    = onCorrected,
+            trail          = trailCopy,
         })
         if not handle then return false, control end
-        active = control
+        if not ended[control] then
+            active = control
+            holdNoclip(control)
+        end
         return true, handle
     end)
 
@@ -31127,7 +31584,10 @@ function M.new(ctx)
             onCorrected = onCorrected,
         })
         if not handle then return false, control end
-        active = control
+        if not ended[control] then
+            active = control
+            holdNoclip(control)
+        end
         return true, handle
     end)
 
@@ -31188,13 +31648,18 @@ function M.new(ctx)
         if type(settings) ~= "table" then return false, Errors.BAD_ARGS end
         if settings.speed ~= nil and not positive(settings.speed) then return false, Errors.BAD_ARGS end
         if settings.broom ~= nil and type(settings.broom) ~= "boolean" then return false, Errors.BAD_ARGS end
+        if settings.noclip ~= nil and type(settings.noclip) ~= "boolean" then return false, Errors.BAD_ARGS end
         if settings.speed ~= nil then speedSetting = clampSpeed(settings.speed) end
         if settings.broom ~= nil then broomSetting = settings.broom end
+        if settings.noclip ~= nil then
+            noclipSetting = settings.noclip
+            if noclipSetting and active then holdNoclip(active) elseif not noclipSetting then dropNoclip(nil) end
+        end
         return true, speedSetting
     end)
 
     expose("settings", function()
-        return true, { speed = speedSetting, ceiling = Tuning.ceiling, broom = broomSetting }
+        return true, { speed = speedSetting, ceiling = Tuning.ceiling, broom = broomSetting, noclip = noclipSetting }
     end)
 
     -- straight-line seconds at the configured speed, for a travel planner weighing a tween against a server jump
@@ -31220,11 +31685,143 @@ function M.new(ctx)
             closed = true
             owner = nil
             if active then active.abort(Errors.CANCELLED) end
+            dropNoclip(nil)
             dropIdle()
         end)
     end
 
     return api
+end
+
+return M
+
+end)
+__bundle_register("Api/Movement/Ways", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- movement ways in: places nothing plans into from the open (a cave whose only mouth is a ledge in a chasm), each an area and its route in from open sky; a trip whose goal is inside one and whose start isn't goes by the route first, and by the route backwards on the way out, so every farm and teleport aimed inside gets there
+local Tuning = require("Api/Movement/Tuning")
+
+local M = {}
+
+-- the more particular place first: a trip to the arena takes the arena's route, not the hall's. roofed: only somewhere under cover counts as inside (the cave's no-fly volume also takes in the mountain's surface over it)
+local LEDGE  = Vector3.new(160, 434, -5580)
+local TUNNEL = Vector3.new(160, 440, -5900)
+M.WAYS = {
+    {
+        name   = "Arachne's Chamber",
+        -- live 2026-10-25: the chamber round Forb Kravitz's "Exterminate Arachne" point (217,543,-6642) and its shrine, ceiling about 600
+        center = Vector3.new(215, 540, -6450),
+        size   = Vector3.new(700, 200, 800),
+        roofed = true,
+        -- the cave's way in, then north out of the tunnel, up the far side of the pit to the chamber floor at 544
+        route  = { LEDGE, TUNNEL, Vector3.new(160, 440, -6020), Vector3.new(170, 470, -6045), Vector3.new(185, 560, -6070), Vector3.new(200, 565, -6110) },
+    },
+    {
+        name   = "Alke Caverns",
+        -- ReplicatedStorage._Locations "Alke Cavern", a no-fly volume over the cave
+        center = Vector3.new(-91, 925, -6680),
+        size   = Vector3.new(2048, 1917, 2048),
+        roofed = true,
+        -- live 2026-10-25: the mountain roofs the whole cave; the way in is a ledge at Y 430 in the chasm on its south edge, the tunnel north at Y 440 (pathfinds to the hall, 3 jumps), then the main hall, from where a low flight reaches the chambers round it
+        route  = { LEDGE, TUNNEL, Vector3.new(-203, 437, -5997) },
+    },
+}
+
+local function inBox(way, position)
+    local half = way.size / 2
+    local offset = position - way.center
+    return math.abs(offset.X) <= half.X and math.abs(offset.Y) <= half.Y and math.abs(offset.Z) <= half.Z
+end
+
+-- covered and known are the trip's probes; somewhere that hasn't streamed in (known says no floor is there to read) is taken at its box's word, since a cave 8,000 studs off reads as open sky until it streams (live 2026-10-25)
+local function inside(way, position, covered, known)
+    if not inBox(way, position) then return false end
+    if way.roofed and covered then
+        if covered(position) == true then return true end
+        if known and not known(position) then return true end
+        return false
+    end
+    return true
+end
+
+function M.inside(position, covered, ways, known)
+    for _, way in ipairs(ways or M.WAYS) do
+        if inside(way, position, covered, known) then return way end
+    end
+    return nil
+end
+
+-- the points a trip from here to goal goes by, in order, or nil when no way applies
+function M.route(here, goal, ways, covered, known)
+    ways = ways or M.WAYS
+    for _, way in ipairs(ways) do
+        local goalIn, hereIn = inside(way, goal, covered, known), inside(way, here, covered)
+        if goalIn ~= hereIn then
+            local points = {}
+            if goalIn then
+                for i = 1, #way.route do points[#points + 1] = way.route[i] end
+            else
+                for i = #way.route, 1, -1 do points[#points + 1] = way.route[i] end
+            end
+            -- joined at the point nearest here: any of them leaving or from inside another of the places, else only those out in the open, so a start on the mountain over the cave still goes in by the mouth
+            local anywhere = hereIn or M.inside(here, covered, ways) ~= nil
+            local at, best = 1, math.huge
+            for i, point in ipairs(points) do
+                if anywhere or M.inside(point, covered, ways) == nil then
+                    local gap = (here - point).Magnitude
+                    if gap < best then at, best = i, gap end
+                end
+            end
+            local out = {}
+            for i = at, #points do out[#out + 1] = points[i] end
+            return out, way.name
+        end
+    end
+    return nil
+end
+
+-- whether a point is one of a way's own: they hang where the route needs them (over a pit, in a tunnel), with no floor to stand a landing on, and each sweeps clear to the next
+function M.isPoint(position, ways)
+    for _, way in ipairs(ways or M.WAYS) do
+        for _, point in ipairs(way.route) do
+            if (point - position).Magnitude < 0.5 then return true end
+        end
+    end
+    return false
+end
+
+-- the whole way's length, start to goal through every point: what a trip's deadline has to allow for
+function M.length(here, goal, ways, covered, known)
+    local points = M.route(here, goal, ways, covered, known)
+    if not points then return (goal - here).Magnitude end
+    local total, from = 0, here
+    for _, point in ipairs(points) do
+        total = total + (point - from).Magnitude
+        from = point
+    end
+    return total + (goal - from).Magnitude
+end
+
+-- wraps a trip's resolver: the next point of the way in (or out) until the root has passed it, then the real target; decided once, on the first call. reach is the trip's own: a point has to count as passed before the trip would take it for its goal and stop there
+function M.through(resolve, rootPosition, ways, reach, covered, known)
+    local passedAt = math.max(Tuning.wayReach, (tonumber(reach) or 0) + Tuning.wayReachSlack)
+    local plan = nil
+    return function()
+        local goal = resolve()
+        if goal == nil then return nil end
+        local here = rootPosition()
+        if here == nil then return goal end
+        if plan == nil then
+            local points = M.route(here, goal, ways, covered, known)
+            plan = points and { points = points, at = 1 } or false
+        end
+        if plan then
+            while plan.at <= #plan.points and (here - plan.points[plan.at]).Magnitude <= passedAt do
+                plan.at = plan.at + 1
+            end
+            if plan.at <= #plan.points then return plan.points[plan.at] end
+        end
+        return goal
+    end
 end
 
 return M
@@ -31297,6 +31894,8 @@ return {
 
     -- the broom (live 2026-10-24): BroomRemote "Active" answers true and the server sets the character's Flying attribute; getting off starts BROOM_COOLDOWN (8 s, StateEnd_ stamped) and asking again inside it answers nothing
     broom            = true,
+    -- the character's own collision is off while a trip runs: routes are already swept clear, so all collision adds is a body snagged on a ledge, a mob or a player the sweep didn't count (players' "we get stuck while traveling", 2026-10-25); a wall is never routed through, so the server's rewind isn't met
+    noclip           = true,
     -- a trip with less than this left goes without it, since getting off costs the cooldown
     broomLeftover    = 80,
     broomPoll        = 0.25,
@@ -31429,6 +32028,32 @@ return {
     escapeTries    = 3,
     -- a roofed goal nothing plans to from here is tried from at most this many open-sky spots round it: level with it, and on the ground over and round it on these rings, read down from this far over the goal to this far under it
     entryTries      = 6,
+    -- a start with something high over it (not roofed) whose climbs all fail slides level out to open sky first: rings this far out, this many directions, the cheapest few swept, at most coverEscapes times a trip
+    coverRings      = { 25, 50, 80, 120, 170, 230, 300 },
+    coverDirections = 16,
+    coverTries      = 12,
+    coverEscapes    = 2,
+    -- a leg under a canopy reads the ground from this far over its line, under the caps (live 2026-10-25: caps 380 over the mushroom region's floor)
+    coverProbeUp    = 100,
+    coverProbeUps   = { 100, 40, 15 },
+    coverProbeDown  = 400,
+    -- a point of a known way in (Ways.lua) counts as passed this close
+    wayReach        = 8,
+    wayReachSlack   = 6,
+    -- a sweep keeps the root this far from a part that kills on touch, about a body's width
+    hazardPad       = 4,
+    -- a goal counts as streamed in when a floor reads under it from this far over it to this far under it
+    wayKnownUp      = 10,
+    wayKnownDown    = 300,
+    -- under cover (a cave, a canopy) the nearest few landing spots are also tried flown low
+    lowTries        = 4,
+    -- the trail kept of where the root has been: a point every trailStep studs, sampled every trailEvery s, the newest trailMax kept, and any move further than trailJump between samples (faster than the broom flies) starting it afresh
+    trailStep       = 6,
+    trailEvery      = 0.1,
+    trailMax        = 600,
+    trailJump       = 90,
+    -- a way back along it shorter than this is no way out
+    trailLeast      = 12,
     entryRings      = { 40, 70, 110 },
     entryDirections = 8,
     entryProbeUp    = 400,
@@ -31464,6 +32089,7 @@ local Errors    = require("Api/Movement/Errors")
 local Planner   = require("Api/Movement/Planner")
 local Probe     = require("Api/Movement/Probe")
 local Tuning    = require("Api/Movement/Tuning")
+local Ways      = require("Api/Movement/Ways")
 
 local distance = Probe.distance
 local now = os.clock
@@ -31847,7 +32473,7 @@ function M.new(deps)
                 remountSince = remountSince or t
                 remountAt = remountAt or position
                 local why = rider.blocked()
-                if why == "nofly" or why == "unsupported" or t - remountSince > Tuning.remountWait then
+                if why == "nofly" or why == "unsupported" or why == "nobroom" or t - remountSince > Tuning.remountWait then
                     base.log("the broom is not coming back (%s); going on without it", tostring(why or "took too long"))
                     hadBroom, remountSince, remountAt = false, nil, nil
                 else
@@ -32198,6 +32824,48 @@ function M.new(deps)
         return nil
     end
 
+    -- an air leg under cover, the ground read from just over its line: from higher first (a canopy hundreds over the floor), lower for a cave whose ceiling is a few dozen over it (live 2026-10-25: Arachne's chamber, ceiling about 40 over a hover)
+    local function lowFly(here, spot, landing, hold)
+        for _, under in ipairs(Tuning.coverProbeUps) do
+            local points = Air.fly(probe, here, spot, landing, airRaise, hold, under)
+            if points or interrupted() then return points end
+        end
+        return nil
+    end
+
+    -- a start under a high overhang (live 2026-10-25: a hollow under the mushroom region's canopy, caps 380 over its floor) is no indoor start, yet every climb from it meets a cap: the leg heads for the nearest ground with nothing at all over it, the one that costs least on the way to the goal, flown low beneath the caps
+    local coverEscapes = 0
+    local function outFromUnder(here)
+        if coverEscapes >= Tuning.coverEscapes or not probe.covered(here) or probe.roofed(here) then return nil end
+        coverEscapes = coverEscapes + 1
+        local open = {}
+        for _, radius in ipairs(Tuning.coverRings) do
+            for i = 0, Tuning.coverDirections - 1 do
+                local a = i / Tuning.coverDirections * 2 * math.pi
+                local x, z = here.X + math.cos(a) * radius, here.Z + math.sin(a) * radius
+                -- the ground under the caps, never a cap's own top
+                local y = probe.floor(x, z, here.Y + Tuning.coverProbeUp, Tuning.coverProbeUp + Tuning.coverProbeDown)
+                if y then
+                    local spot = Vector3.new(x, y + probe.height, z)
+                    if not probe.covered(spot) then open[#open + 1] = { spot = spot, cost = radius + flatDistance(spot, goal) } end
+                end
+            end
+            if interrupted() then return nil end
+        end
+        table.sort(open, function(a, b) return a.cost < b.cost end)
+        for i = 1, math.min(#open, Tuning.coverTries) do
+            local spot = open[i].spot
+            local points = lowFly(here, spot, true)
+            if interrupted() then return nil end
+            if not points and probe.sweep(here, spot, true) then points = { spot } end
+            if points then
+                base.log("under an overhang; getting out from under it first")
+                return { points = points, goal = spot, air = true }, false
+            end
+        end
+        return nil
+    end
+
     -- flying is allowed and only geometry is off limits, so a leg goes through the air whenever it can; nil hands it to pathfinding
     local function airLeg(here)
         if not Tuning.airRoutes then return nil end
@@ -32205,16 +32873,35 @@ function M.new(deps)
         if final then
             streamOnce(goal)
             if interrupted() then return nil end
+            -- a way in's own point (live 2026-10-25: the climb out of the pit into Arachne's chamber, in mid-air) has no floor for a landing spot, and sweeps clear from the last, so it's flown straight to
+            -- the walking box first: the tunnel's low spot (live 2026-10-25, 158,433,-5696) clips the lifted one, and the leg is walked when only the walking box clears it
+            if Ways.isPoint(goal) then
+                if probe.sweep(here, goal) then return { points = { goal }, goal = goal, air = false }, true end
+                if probe.sweep(here, goal, true) then return { points = { goal }, goal = goal, air = true }, true end
+            end
+            local low = probe.covered(here) or probe.covered(goal)
             if air then
                 local points = Air.fly(probe, here, goal, true, airRaise) or throughSide(here, goal)
+                if not points and low then points = lowFly(here, goal, true) end
                 if points then return { points = points, goal = goal, air = true }, true end
-                return nil
+                return outFromUnder(here)
             end
             local spots = Planner.candidates(probe, here, goal, { final = true, reach = reach })
             for _, spot in ipairs(spots) do
                 local points = Air.fly(probe, here, spot, true, airRaise)
                 if interrupted() then return nil end
                 if points then return { points = points, goal = spot, air = true }, true end
+            end
+            -- under cover (live 2026-10-25: Alke spiders up on the Alke Caverns' ledges, which nothing pathfinds to) the air under the roof is flown, the ground read from just over the line
+            if low then
+                for i = 1, math.min(#spots, Tuning.lowTries) do
+                    local points = lowFly(here, spots[i], true)
+                    if interrupted() then return nil end
+                    if points then
+                        base.log("under cover; flying low to it")
+                        return { points = points, goal = spots[i], air = true }, true
+                    end
+                end
             end
             for i = 1, math.min(#spots, 2) do
                 local points = throughSide(here, spots[i])
@@ -32224,7 +32911,7 @@ function M.new(deps)
                     return { points = points, goal = spots[i], air = true }, true
                 end
             end
-            return nil
+            return outFromUnder(here)
         end
         local legEnd = pointToward(here, Tuning.airLeg)
         streamOnce(legEnd)
@@ -32234,7 +32921,15 @@ function M.new(deps)
         local hold = Air.ahead(probe, legEnd, pointToward(legEnd, Tuning.airLookahead))
         local points = Air.fly(probe, here, legEnd, false, airRaise, hold)
         if points then return { points = points, goal = points[#points], air = true }, false end
-        return nil
+        -- under a canopy every climb meets it: the leg is flown low beneath it toward the goal instead, until a leg starts in the open
+        if not interrupted() and probe.covered(here) then
+            local low = lowFly(here, legEnd, false)
+            if low then
+                base.log("under a canopy; flying low beneath it")
+                return { points = low, goal = low[#low], air = true }, false
+            end
+        end
+        return outFromUnder(here)
     end
 
     -- a goal under a roof that nothing plans to from here (live 2026-10-24: the Dire Wolf's den, under the terrain beside a giant skull) is entered on foot from where the pathfinder's own route last has open sky, flown to first
@@ -32450,6 +33145,32 @@ function M.new(deps)
         return result
     end
 
+    -- nothing plans out of here (live 2026-10-25: a hollow under the mushroom region's canopy, every open spot round it the top of another mushroom), yet the character came in through clear air: back along the trail to the newest point with nothing over it, then planned from there
+    local backtracked = false
+    local function backtrack(job, here)
+        if backtracked or type(deps.trail) ~= "function" or not probe.covered(here) then return nil end
+        backtracked = true
+        local points = deps.trail()
+        if type(points) ~= "table" or #points < 2 then return nil end
+        local route, from, open = {}, here, false
+        for i = #points, 1, -1 do
+            local point = points[i]
+            if distance(point, from) >= 1 then
+                route[#route + 1] = point
+                from = point
+            end
+            if not probe.covered(point) then
+                open = true
+                break
+            end
+        end
+        if not open or #route == 0 or distance(route[#route], here) < Tuning.trailLeast then return nil end
+        base.log("no way out from here; going back the way we came in")
+        local current = { points = route, kind = "moving", final = false, target = route[#route], air = true }
+        run(job, current)
+        return current.ended == "done"
+    end
+
     -- an indoor start with a far goal heads out under open sky first: a short path to the nearest spot with nothing over it, or the doors when none is reachable, instead of far legs planned through a door the pathfinder thinks is shut; nil when it did not apply or got nowhere
     local escapes = 0
     local function escapeFirst(job, here)
@@ -32515,6 +33236,8 @@ function M.new(deps)
                     if finished then return end
                 elseif not interrupted() and not plan then
                     local recovered = recover(job, here)
+                    if finished then return end
+                    if recovered == nil then recovered = backtrack(job, here) end
                     if finished then return end
                     if recovered == nil then return land(job, Errors.NO_PATH) end
                 elseif not interrupted() then
@@ -32646,6 +33369,7 @@ __bundle_register("Api/Movement/Probe", function(require, _LOADED, __bundle_regi
 -- movement probe: the geometry a trip asks about (floor under a point, whether the body box sweeps cleanly from one spot to the next, whether a spot is free to stand in), answered against CanCollide parts only with every character and mob left out
 
 local Services = require("Services")
+local Hazards = require("Api/Movement/Hazards")
 local Tuning   = require("Api/Movement/Tuning")
 
 local Workspace = Services.Workspace
@@ -32857,6 +33581,8 @@ function M.new(char, height, onFault)
         local length = math.sqrt(dx * dx + dy * dy + dz * dz)
         if length < ZERO_LENGTH then return true end
         if entersZone(a, b) then return false end
+        -- nothing hit to measure, so an air leg lifts the whole line over it
+        if Hazards.crosses(a, b) then return false end
         local chunks = math.ceil(length / Tuning.maxSegment)
         local step = Vector3.new(dx / chunks, dy / chunks, dz / chunks)
         local flat = math.sqrt(dx * dx + dz * dz)
@@ -32922,6 +33648,81 @@ function M.new(char, height, onFault)
 end
 
 M.distance = distance
+
+return M
+
+end)
+__bundle_register("Api/Movement/Hazards", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- movement hazards: the parts that kill on touch (the map's KillBricks: not collidable, a server KillScript under each; live 2026-10-25 one lines the pit under Arachne's chamber), kept as they stream in and out; every probe respects collision and would sweep straight through one, so a sweep refuses any segment that comes within a body of one
+local Services = require("Services")
+local Tuning   = require("Api/Movement/Tuning")
+
+local M = {}
+
+local NAMES = { KillBrick = true }
+local parts = {}
+
+local function consider(instance)
+    if NAMES[instance.Name] and instance:IsA("BasePart") then parts[instance] = true end
+end
+
+local function forget(instance)
+    parts[instance] = nil
+end
+
+-- track takes each connection, so the caller's maid lets them go at unload; false when the map isn't there to watch
+function M.start(track)
+    local map = Services.Workspace:FindFirstChild("Map")
+    if map == nil then return false end
+    for _, descendant in ipairs(map:GetDescendants()) do consider(descendant) end
+    track(map.DescendantAdded:Connect(consider))
+    track(map.DescendantRemoving:Connect(forget))
+    return true
+end
+
+function M.stop()
+    table.clear(parts)
+end
+
+function M.count()
+    local n = 0
+    for _ in pairs(parts) do n = n + 1 end
+    return n
+end
+
+-- the segment against the part's box grown by pad, in the part's own space (slab test)
+local function segmentHits(a, b, part, pad)
+    local cf, size = part.CFrame, part.Size
+    local la, lb = cf:PointToObjectSpace(a), cf:PointToObjectSpace(b)
+    local enter, leave = 0, 1
+    for _, axis in ipairs({ "X", "Y", "Z" }) do
+        local from, to = la[axis], lb[axis]
+        local half = size[axis] / 2 + pad
+        local d = to - from
+        if math.abs(d) < 1e-9 then
+            if from < -half or from > half then return false end
+        else
+            local t0, t1 = (-half - from) / d, (half - from) / d
+            if t0 > t1 then t0, t1 = t1, t0 end
+            if t0 > enter then enter = t0 end
+            if t1 < leave then leave = t1 end
+            if enter > leave then return false end
+        end
+    end
+    return true
+end
+
+function M.crosses(a, b)
+    for part in pairs(parts) do
+        if part.Parent == nil then
+            parts[part] = nil
+        else
+            local ok, hit = pcall(segmentHits, a, b, part, Tuning.hazardPad)
+            if ok and hit then return true, part end
+        end
+    end
+    return false
+end
 
 return M
 
@@ -33648,6 +34449,10 @@ function M.rider(deps)
     local function blocker()
         -- a broom this executor cannot steer is never summoned
         if not M.supported() then return "unsupported" end
+        -- a character before Johan's quest has no broom to call (PlayerFolder.BroomUnlocked and Broom, live 2026-10-25)
+        local okUnlocked, unlocked = State.stat("BroomUnlocked")
+        local okName, name = State.stat("Broom")
+        if okUnlocked and unlocked ~= true and not (okName and type(name) == "string" and name ~= "") then return "nobroom" end
         if M.noFlyZone() then return "nofly" end
         local okFight, fighting = State.inCombat()
         if okFight and fighting then return "combat" end
@@ -33801,10 +34606,10 @@ local Water  = require("Api/Movement/Water")
 local M = {}
 
 -- a first guess at the lowest safe root height along the line, read across the body's whole width and never under the water the game would swim it in; thin walls fall between samples and are learned from the sweeps instead
-local function profile(probe, here, spot, length, ux, uz, toEnd, level)
+local function profile(probe, here, spot, length, ux, uz, toEnd, level, probeUp)
     local half = Tuning.bodyWidth / 2 + Tuning.airSidePad
     local px, pz = -uz, ux
-    local top = math.max(here.Y, spot.Y) + Tuning.airProbeUp
+    local top = math.max(here.Y, spot.Y) + probeUp
     local samples = math.max(1, math.ceil(length / Tuning.airSample))
     local out, unknown = {}, false
     local last = samples - 1
@@ -33940,8 +34745,9 @@ function M.porches(probe, spot, here)
     return out
 end
 
--- the points from here to spot: landing ends standing on spot, otherwise the leg ends at the lowest safe height over it, never under hold (what the stretch after it needs); a raise asked for after a rewind or a hold-up is always flown, even where the straight line sweeps clear
-function M.fly(probe, here, spot, landing, raise, hold)
+-- the points from here to spot: landing ends standing on spot, otherwise the leg ends at the lowest safe height over it, never under hold (what the stretch after it needs); a raise asked for after a rewind or a hold-up is always flown, even where the straight line sweeps clear; under, the ground is read from that far over the line rather than airProbeUp, so a leg under a high canopy hugs the floor beneath it instead of taking the canopy's top for ground
+function M.fly(probe, here, spot, landing, raise, hold, under)
+    local probeUp = under or Tuning.airProbeUp
     local level = Water.reader()
     if landing and (raise or 0) <= 0 and dry(level, here, spot) and probe.sweep(here, spot, true) then return { spot } end
 
@@ -33952,7 +34758,7 @@ function M.fly(probe, here, spot, landing, raise, hold)
         return { spot }
     end
     local ux, uz = dx / length, dz / length
-    local crests, unknown = profile(probe, here, spot, length, ux, uz, not landing, level)
+    local crests, unknown = profile(probe, here, spot, length, ux, uz, not landing, level, probeUp)
     local lift = raise or 0
     if unknown then lift = lift + Tuning.airUnknownMargin end
 
@@ -33963,7 +34769,7 @@ function M.fly(probe, here, spot, landing, raise, hold)
         if hold and hold > tail then tail = hold end
         tail = tail + lift
     end
-    local top = math.max(here.Y, spot.Y) + Tuning.airProbeUp
+    local top = math.max(here.Y, spot.Y) + probeUp
 
     local function at(s, y) return Vector3.new(here.X + ux * s, y, here.Z + uz * s) end
 
@@ -33991,7 +34797,7 @@ function M.fly(probe, here, spot, landing, raise, hold)
             -- learn the obstacle that stopped it: its top where it was hit, read a little either side of the contact
             local s = math.clamp((hit.X - here.X) * ux + (hit.Z - here.Z) * uz, 0, length)
             -- read from well over the contact, never from under a cliff the leg's own reach started inside (live 2026-10-24: a 300-plus stud cliff near Kamo was crept up 3 studs a round)
-            local from = math.max(top, hit.Y + Tuning.airProbeUp)
+            local from = math.max(top, hit.Y + probeUp)
             local high = nil
             for _, nudge in ipairs({ 0, Tuning.airNudge, -Tuning.airNudge }) do
                 local y = probe.floor(hit.X + ux * nudge, hit.Z + uz * nudge, from, Tuning.airProbeDepth)
@@ -34670,7 +35476,7 @@ function M.new(ctx)
         opts = readOpts(opts)
         if opts == nil or (opts.prompt ~= nil and not isPrompt(opts.prompt)) then return false, Errors.BAD_ARGS end
         if not coroutine.isyieldable() then return false, Errors.BAD_ARGS end
-        if interactDisabled(target) then return false, Errors.DISABLED end
+        -- the InteractDisabled tag alone refuses nothing: every starter npc carries it and the server still opens their dialogue (live 2026-10-25, a fresh character's Chief Farris); it only explains an npc that never answers
         local prompt = opts.prompt or talkPrompt(target)
         if prompt == nil then return false, Errors.NO_PROMPT end
         if serverDisabled(prompt) then return false, Errors.DISABLED end
@@ -37415,7 +38221,16 @@ local function denyKey(segments, path)
     return path
 end
 
+local function placeId()
+    local ok, id = pcall(function() return game.PlaceId end)
+    if ok then return id end
+    return nil
+end
+
 local function remoteDenied(key, first)
+    local id = placeId()
+    local here = id ~= nil and Deny.places and Deny.places[id]
+    if here and here[key] then return false end
     if Deny.remotes[key] then return true end
     for i, tree in ipairs(Deny.trees) do
         if key == tree or key:sub(1, #TREE_PREFIXES[i]) == TREE_PREFIXES[i] then return true end
@@ -38027,6 +38842,11 @@ return {
     packets = {
         Tools     = { Horn = true },
         Inventory = { Tool = true, Equip = true },
+    },
+
+    -- place id -> remotes the deny list lets through there: the menu place's own scripts call these (the slot list, the wipe confirm, slot data; live 2026-10-25), World's never do
+    places = {
+        [8248164019] = { Wipe = true, DataRequest = true, RequestCreatedSlots = true },
     },
 
     -- remote path -> first arguments that are refused (matched case-insensitively)
@@ -39559,6 +40379,20 @@ return function(deps)
         Callback = pushBroom,
     })
     pushBroom(Toggles.TpBroom.Value)
+
+    local noclip = true
+    if okSettings and type(settings) == "table" and type(settings.noclip) == "boolean" then noclip = settings.noclip end
+    local function pushNoclip(value)
+        Movement.configure({ noclip = value == true })
+    end
+
+    box:AddToggle("TpNoclip", {
+        Text     = "Don't Get Stuck",
+        Default  = noclip,
+        Tooltip  = "Turns your character's collision off while you travel, so you never catch on ledges, trees, monsters or other players on the way. Trips still go around walls, since going through one gets you pulled back.",
+        Callback = pushNoclip,
+    })
+    pushNoclip(Toggles.TpNoclip.Value)
 
     box:AddSlider("TpReach", {
         Text     = "Stop Distance",
@@ -41378,14 +42212,14 @@ end
 
 end)
 __bundle_register("Tabs/Farm", function(require, _LOADED, __bundle_register, __bundle_modules)
--- farm tab: autofarm settings heads the left column with the mob, boss and quest farms under it, the gathering farm heads the right with the broom race farm, auto sell and the farm stats under it, all built through UI/Place over the apis they drive
+-- farm tab: autofarm settings heads the left column with the mob, boss and quest farms and the magic reroll under it, the gathering farm heads the right with the broom race farm, auto sell and the farm stats under it, all built through UI/Place over the apis they drive
 local Host = require("Tabs/Host")
 local Farm = require("Features/Clover/Farm")
 
 return function(ctx)
     if ctx.Config.Farm then
         Farm(Host.at(ctx, ctx.Tabs.Farm, {
-            ["Autofarm Settings"] = "Left", ["Mob Farm"] = "Left", ["Boss Farm"] = "Left", ["Quest Farm"] = "Left", ["Auto Sell"] = "Right", ["Gathering Farm"] = "Right", ["Broom Race Farm"] = "Right", ["Farm Stats"] = "Right",
+            ["Autofarm Settings"] = "Left", ["Mob Farm"] = "Left", ["Boss Farm"] = "Left", ["Quest Farm"] = "Left", ["Magic Reroll"] = "Left", ["Auto Sell"] = "Right", ["Gathering Farm"] = "Right", ["Broom Race Farm"] = "Right", ["Farm Stats"] = "Right",
         }))
     end
 end
@@ -41393,9 +42227,11 @@ end
 end)
 __bundle_register("Features/Clover/Farm", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- farm orchestrator: builds the autofarm settings, mob farm, boss farm, quest farm, gathering farm, broom race farm, auto sell and farm stats boxes through UI/Place (the tab file decides where each goes), runs whichever farm is switched on through one engine (switching one on switches the others off), and keeps the status and stats lines fresh while the menu is open
+local Jobs      = require("Utility/Jobs")
 local Log       = require("Utility/Log")
 local Mount     = require("Utility/Mount")
 local Scheduler = require("Utility/Scheduler")
+local Store     = require("Utility/Store")
 local Place     = require("UI/Place")
 local Premium   = require("UI/Premium")
 local Ui        = require("Features/Clover/Gathering/Ui")
@@ -41405,9 +42241,22 @@ local Mobs      = require("Features/Clover/Farm/Mobs")
 local Nodes     = require("Features/Clover/Farm/Nodes")
 local Quests    = require("Features/Clover/Farm/Quests")
 local Races     = require("Features/Clover/Farm/Races")
+local Reroll    = require("Features/Clover/Farm/Reroll")
 
 local REFRESH_EVERY = 0.5
 local MOB_FARM, NODE_FARM, RACE_FARM, QUEST_FARM, BOSS_FARM = "Mob Farm", "Gathering Farm", "Broom Race Farm", "Quest Farm", "Boss Farm"
+local REROLL_FARM = "Magic Reroll"
+-- the reroll's run outlives each place it visits (World, the menu, World again), so it is kept on disk
+local REROLL_NS, REROLL_KEY = Store.GAME .. "/reroll", "state"
+-- GrimoireRarity.lua:779-812 (weights .22 .22 .20 .15 .15 .05 .01; Spatial is never rolled)
+local MAGICS = { "Flame", "Light", "Wind", "Lightning", "Shadow", "Beast", "Time" }
+local VARIANTS = {
+    "Amaterasu", "Azure", "Holy", "Moon", "Radiant", "Scarlet", "Crimson", "Sandstorm", "Zephyr", "Ocean Breeze",
+    "Storm", "Solar", "Verdant", "Bloodstorm", "Ignis", "Void", "Bloodshade", "Miasma", "Phantom", "Silverfang", "Duskfang",
+    "Gilded", "Monochrome", "Cosmic",
+}
+local WEAPONS = { "Dull Gauntlets", "Novice Blade", "Dull Longsword", "Rustic Spear" }
+local MENU_PLACE = 8248164019
 local DEFAULT_COURSE = "Kamo Broom Blitz"
 local RACE_SPEED = 330
 local STOP_LINES = {
@@ -41461,15 +42310,29 @@ return function(ctx)
     local raceCfg = { course = DEFAULT_COURSE, speed = RACE_SPEED, challenge = true, best = true }
     local questCfg = { givers = {}, best = true }
     local bossCfg = { bosses = {}, loot = true }
+    local rerollState = Store.read(REROLL_NS, REROLL_KEY, nil)
+    if type(rerollState) ~= "table" then rerollState = {} end
+    local rerollCfg = {
+        wanted = asSet(rerollState.wanted), variants = asSet(rerollState.variants), weapon = rerollState.weapon or WEAPONS[1],
+        allowWipe = rerollState.allowWipe == true, maxLevel = tonumber(rerollState.maxLevel) or 20, state = rerollState,
+    }
+    local function saveReroll(state)
+        state.wanted, state.variants = sortedKeys(rerollCfg.wanted), sortedKeys(rerollCfg.variants)
+        state.weapon, state.allowWipe, state.maxLevel = rerollCfg.weapon, rerollCfg.allowWipe, rerollCfg.maxLevel
+        Store.write(REROLL_NS, REROLL_KEY, state)
+    end
+    rerollCfg.save = saveReroll
     local brains = {
         [MOB_FARM]   = Mobs.new(mobCfg),
         [NODE_FARM]  = Nodes.new(nodeCfg),
         [RACE_FARM]  = Races.new(raceCfg),
         [QUEST_FARM] = Quests.new(questCfg, { mob = mobCfg, node = nodeCfg, race = raceCfg }),
         [BOSS_FARM]  = Bosses.new(bossCfg, { mob = mobCfg }),
+        [REROLL_FARM] = Reroll.new(rerollCfg),
     }
     local toggleOf = {
         [MOB_FARM] = "FarmMobs", [NODE_FARM] = "FarmNodes", [RACE_FARM] = "FarmRaces", [QUEST_FARM] = "FarmQuests", [BOSS_FARM] = "FarmBosses",
+        [REROLL_FARM] = "FarmReroll",
     }
     -- the quest picker shows "title (giver)", the farm wants the giver
     local giverOf = {}
@@ -41490,6 +42353,9 @@ return function(ctx)
             if line and toggle and toggle.Value then Ui.set(toggle, false) end
         end,
     })
+
+    -- live probes read the running farm, its status and stats through here
+    ctx.FarmEngine = engine
 
     local function switch(name, on)
         if on then
@@ -41748,6 +42614,99 @@ return function(ctx)
         depends:SetupDependencies({ { Toggles.FarmRaces, true } })
     end
 
+    -- ===== magic reroll =====
+    local rerollBox = Place.groupbox(ctx, REROLL_FARM, "dices", { fallback = "Farm", side = "Left" })
+    local rerollLine
+    local function rerollReport()
+        local state = rerollCfg.state
+        local lines = { ("Rolls so far: %d"):format(tonumber(state.rolls) or 0) }
+        if state.history and #state.history > 0 then lines[#lines + 1] = ("Latest: %s"):format(table.concat(state.history, ", ", 1, math.min(#state.history, 5))) end
+        return table.concat(lines, "\n")
+    end
+    if rerollBox then
+        rerollBox:AddLabel("Takes a new character to level 15, gets its grimoire, and if it isn't a magic you picked, wipes the character and goes again. It does the starter quests and races for you.", true)
+        rerollBox:AddToggle("FarmReroll", {
+            Premium  = true,
+            Text     = REROLL_FARM,
+            Default  = false,
+            Tooltip  = "Rolls for the magic you pick by wiping this character and starting over until you get it. It keeps going through the menu by itself.",
+            Callback = function(on)
+                rerollCfg.state.active = on == true
+                saveReroll(rerollCfg.state)
+                switch(REROLL_FARM, on == true)
+            end,
+        })
+        local depends = rerollBox:AddDependencyBox()
+        labels[REROLL_FARM] = depends:AddLabel("Off", true)
+        depends:AddDropdown("FarmRerollMagic", {
+            Premium  = true,
+            Text     = "Magic To Keep",
+            Values   = MAGICS,
+            Default  = sortedKeys(rerollCfg.wanted),
+            Multi    = true,
+            Tooltip  = "Stops as soon as you get one of these. Time and Beast are rare, so they can take many rolls.",
+            Callback = function(value)
+                rerollCfg.wanted = asSet(value)
+                saveReroll(rerollCfg.state)
+            end,
+        })
+        depends:AddDropdown("FarmRerollVariants", {
+            Premium    = true,
+            Text       = "Only These Variants",
+            Values     = VARIANTS,
+            Default    = sortedKeys(rerollCfg.variants),
+            Multi      = true,
+            Searchable = true,
+            Tooltip    = "Leave empty to keep any version of the magic above. Pick variants to keep rolling until you get one of them.",
+            Callback   = function(value)
+                rerollCfg.variants = asSet(value)
+                saveReroll(rerollCfg.state)
+            end,
+        })
+        depends:AddDropdown("FarmRerollWeapon", {
+            Premium  = true,
+            Text     = "Starter Weapon",
+            Values   = WEAPONS,
+            Default  = rerollCfg.weapon,
+            Tooltip  = "The weapon each new character picks at the start.",
+            Callback = function(value)
+                if type(value) == "string" and value ~= "" then rerollCfg.weapon = value end
+                saveReroll(rerollCfg.state)
+            end,
+        })
+        depends:AddToggle("FarmRerollAllowWipe", {
+            Premium  = true,
+            Text     = "Allow Wipes",
+            Default  = rerollCfg.allowWipe,
+            Tooltip  = "Lets it wipe the character it's playing when the magic isn't one you picked. Wiping can't be undone. Off, it stops and tells you instead.",
+            Callback = function(on)
+                rerollCfg.allowWipe = on == true
+                saveReroll(rerollCfg.state)
+            end,
+        })
+        depends:AddSlider("FarmRerollMaxLevel", {
+            Premium  = true,
+            Text     = "Never Wipe Above Level",
+            Default  = rerollCfg.maxLevel,
+            Min      = 15,
+            Max      = 80,
+            Rounding = 0,
+            Tooltip  = "Protects your real characters: anything above this level is never wiped, even with Allow Wipes on.",
+            Callback = function(value)
+                rerollCfg.maxLevel = tonumber(value) or 20
+                saveReroll(rerollCfg.state)
+            end,
+        })
+        rerollLine = depends:AddLabel(rerollReport(), true)
+        depends:SetupDependencies({ { Toggles.FarmReroll, true } })
+    end
+    rerollCfg.onKept = function(magic, variant)
+        rerollCfg.state.active, rerollCfg.state.pendingWipe = false, nil
+        saveReroll(rerollCfg.state)
+        Ui.notify(Library, ("Magic Reroll got you %s magic (%s) after %d rolls."):format(tostring(magic), tostring(variant or "Default"), tonumber(rerollCfg.state.rolls) or 0))
+        if Toggles.FarmReroll and Toggles.FarmReroll.Value then Ui.set(Toggles.FarmReroll, false) end
+    end
+
     -- ===== auto sell =====
     local sellBox = Place.groupbox(ctx, "Auto Sell", "coins", { fallback = "Farm", side = "Right" })
     local sellPicker
@@ -41897,6 +42856,7 @@ return function(ctx)
             end
         end
         Ui.text(statsLabel, statsLine())
+        if rerollLine then Ui.text(rerollLine, rerollReport()) end
     end
 
     loadLists()
@@ -41906,9 +42866,447 @@ return function(ctx)
         refresh()
     end, { name = "Farm.refresh", interval = REFRESH_EVERY, deferrable = true }))
 
+    -- the reroll goes on wherever it lands: in the menu it wipes the slot it was sent to wipe, then loads it and joins World; in World it switches itself back on
+    if rerollCfg.state.active then
+        local Slots = Api.Slots
+        if game.PlaceId == MENU_PLACE and type(Slots) == "table" then
+            O.track(Jobs.spawn(function(job)
+                local state = rerollCfg.state
+                if not job:sleep(2) then return end
+                local slot = state.pendingWipe
+                if slot == nil then
+                    local okSlots, list = Slots.slots()
+                    slot = okSlots and list[1] or nil
+                end
+                if slot == nil then
+                    Log.devwarn("Farm", "magic reroll: no slot to go on with")
+                    return
+                end
+                if state.pendingWipe then
+                    local okData, data = Slots.slotData(slot)
+                    if not okData then
+                        Log.devwarn("Farm", "magic reroll: couldn't read slot %s: %s", tostring(slot), tostring(data))
+                        return
+                    end
+                    if not rerollCfg.allowWipe or data.level > rerollCfg.maxLevel then
+                        Log.devwarn("Farm", "magic reroll: slot %s (level %d) isn't allowed to be wiped", tostring(slot), data.level)
+                        state.active, state.pendingWipe = false, nil
+                        saveReroll(state)
+                        return
+                    end
+                    local okWipe, why = Slots.wipe(slot, false)
+                    if not okWipe then
+                        Log.devwarn("Farm", "magic reroll: wiping slot %s failed: %s", tostring(slot), tostring(why))
+                        return
+                    end
+                    state.pendingWipe = nil
+                    saveReroll(state)
+                end
+                local okLoad, whyLoad = Slots.load(slot)
+                if not okLoad then
+                    Log.devwarn("Farm", "magic reroll: loading slot %s failed: %s", tostring(slot), tostring(whyLoad))
+                    return
+                end
+                Slots.name()
+                if not job:sleep(1) then return end
+                Slots.joinWorld()
+            end, { name = "Farm.rerollMenu" }))
+        elseif Toggles.FarmReroll and not Toggles.FarmReroll.Value then
+            Ui.set(Toggles.FarmReroll, true)
+        end
+    end
+
     O.onUnload(function() engine.stop("unload") end)
     O.finalize()
 end
+
+end)
+__bundle_register("Features/Clover/Farm/Reroll", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- magic reroll farm brain: takes a fresh character from its weapon pick to its grimoire and judges the magic it got: the starter quests up to Johan's broom (Chief Farris, Vulcan, Eira's bamboo, Johan's cloth and wood), broom races to level 15, then Merlin and the ceremony; a magic you picked ends the farm, any other sends you to the menu, where Farm/init wipes the slot and brings you back to go again
+local Nodes = require("Features/Clover/Farm/Nodes")
+local Races = require("Features/Clover/Farm/Races")
+
+local M = {}
+
+local GRIMOIRE_LEVEL = 15
+local TALK_REACH = 4
+-- Merlin stands on the Magic Tower's balcony and the ceremony runs once you're in the hall below (live 2026-10-24, the test character's own grimoire)
+local MERLIN = Vector3.new(1126, 439, 2786)
+local HALL = Vector3.new(1123, 444, 2835)
+-- the ceremony sets the magic about 30 s after you stand in the hall, at its ViewGrimoires phase (live 2026-10-25)
+local CEREMONY_WAIT = 90
+-- the wood Johan wants is sold in Kamo; nothing gathers it
+local WOOD = "Wood"
+local WOOD_NEEDED = 2
+local BROOM = "Initiates Broom"
+-- after asking for the menu, this long before asking again
+local MENU_RETRY = 15
+-- a kept roll tries this many steps at most (the trip there counts) to get back to Merlin before the farm leaves the rest of the grimoire quest to you
+local MERLIN_TRIES = 6
+
+local function stock(player, name)
+    local inventory = player:FindFirstChild("Inventory")
+    local item = inventory and inventory:FindFirstChild(name)
+    if item == nil then return 0 end
+    local count = item:GetAttribute("Stock")
+    if type(count) == "number" then return count end
+    return 1
+end
+
+local function quest(player, key)
+    local quests = player:FindFirstChild("Quests")
+    return quests and quests:FindFirstChild(key) or nil
+end
+
+local function completed(player, key)
+    local found = quest(player, key)
+    return found ~= nil and found:GetAttribute("Completed") == true
+end
+
+local function taskDone(player, key, taskName)
+    local found = quest(player, key)
+    local tasks = found and found:FindFirstChild("Tasks")
+    local entry = tasks and tasks:FindFirstChild(taskName)
+    if entry == nil then return false end
+    local progress, max = entry:GetAttribute("TaskProgress"), entry:GetAttribute("TaskMax")
+    return type(progress) == "number" and type(max) == "number" and progress >= max
+end
+
+-- cfg is the live settings table the menu writes: wanted (a set of magics), variants (a set, empty means any), weapon, allowWipe, maxLevel, plus state (the saved run: rolls, last) with save(state) and onKept(magic, variant)
+function M.new(cfg)
+    local brain = {}
+    local nodeCfg = { items = {}, ownTools = true }
+    -- the short course by Kamo, kept to: the best-course picker tries every course first, and flew a level 12 9,000 studs to sample one (live 2026-10-25)
+    local raceCfg = { course = "Kamo Broom Blitz", speed = 330, challenge = true, best = false }
+    local gather = Nodes.new(nodeCfg)
+    local race = Races.new(raceCfg)
+    local menuAskedAt = nil
+    local merlinVisits = 0
+
+    function brain.begin()
+        gather.begin()
+        race.begin()
+        menuAskedAt, merlinVisits = nil, 0
+    end
+
+    function brain.stop(why)
+        if race.stop then pcall(race.stop, why) end
+    end
+
+    local function player()
+        return game:GetService("Players").LocalPlayer
+    end
+
+    local function folder()
+        return player():FindFirstChild("PlayerFolder")
+    end
+
+    -- dialogue npcs live under workspace.NPCS, quest ones like Merlin under Objects.QuestNPCS (live 2026-10-25)
+    local function npc(name)
+        local npcs = workspace:FindFirstChild("NPCS")
+        local found = npcs and npcs:FindFirstChild(name, true)
+        if found then return found end
+        local objects = workspace:FindFirstChild("Objects")
+        local quest = objects and objects:FindFirstChild("QuestNPCS")
+        return quest and quest:FindFirstChild(name) or nil
+    end
+
+    -- to the npc and into their dialogue; the session is the open dialogue (its tree when the server sent one)
+    local function talkTo(kit, name)
+        local model = npc(name)
+        if not model then
+            kit.status(("Can't find %s yet."):format(name))
+            kit.sleep(1)
+            return nil
+        end
+        local here = kit.position()
+        local okPivot, at = pcall(function() return model:GetPivot().Position end)
+        if here and okPivot and (here - at).Magnitude > TALK_REACH + 4 then
+            kit.status(("Going to %s."):format(name))
+            kit.travel(model, { reach = TALK_REACH })
+            return nil
+        end
+        local Interact = kit.api("Interact")
+        if not Interact then return nil end
+        if kit.flying() then kit.land() end
+        kit.status(("Talking to %s."):format(name))
+        local ok, session = Interact.talk(model)
+        -- Merlin's prompt is a plain ProximityPrompt, not a ChatPrompt
+        if not ok and session == Interact.Errors.NO_PROMPT then
+            local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt then ok, session = Interact.talk(model, { prompt = prompt }) end
+        end
+        if not ok then
+            kit.sleep(1)
+            return nil
+        end
+        return session
+    end
+
+    local function closeDialogue(kit)
+        local Interact = kit.api("Interact")
+        if Interact then pcall(Interact.close) end
+    end
+
+    -- a quest giver whose dialogue offers a quest: taken, then the dialogue closed
+    local function take(kit, name)
+        local session = talkTo(kit, name)
+        if not session then return end
+        local Quests = kit.api("Quests")
+        if Quests then Quests.acceptFrom(session) end
+        closeDialogue(kit)
+    end
+
+    local function gatherOne(kit, item)
+        nodeCfg.items = { [item] = true }
+        gather.step(kit)
+    end
+
+    local function buyWood(kit)
+        local Shop = kit.api("Shop")
+        if not Shop then return end
+        local need = WOOD_NEEDED - stock(player(), WOOD)
+        local okFind, listings = Shop.find(WOOD, kit.position())
+        local listing = okFind and type(listings) == "table" and listings[1] or nil
+        if not listing or not listing.position then
+            kit.status("Looking for somewhere selling wood.")
+            kit.sleep(2)
+            return
+        end
+        local here = kit.position()
+        if here and (here - listing.position).Magnitude > 8 then
+            kit.status("Going to buy wood for Johan.")
+            kit.travel(listing.position, { reach = 5 })
+            return
+        end
+        kit.status("Buying wood for Johan.")
+        Shop.buy(WOOD, need)
+        kit.sleep(1)
+    end
+
+    -- the quests a new character starts with, as far as Johan's broom; true while there's still one to do
+    local function starter(kit)
+        local p = player()
+        if not completed(p, "Introduction") then
+            take(kit, "Chief Farris")
+            return true
+        end
+        if not taskDone(p, "Helping", "Claim your reward from Vulcan") then
+            local session = talkTo(kit, "Vulcan the Blacksmith")
+            if session then closeDialogue(kit) end
+            return true
+        end
+        if not completed(p, "Eira") then
+            if not quest(p, "Eira") then
+                take(kit, "Eira")
+            elseif stock(p, "Bamboo") < 1 then
+                kit.status("Harvesting bamboo for Eira.")
+                gatherOne(kit, "Bamboo")
+            else
+                -- the giver hands it in as their dialogue opens with every task done
+                if talkTo(kit, "Eira") then closeDialogue(kit) end
+            end
+            return true
+        end
+        if not completed(p, "Johan") then
+            if not quest(p, "Johan") then
+                take(kit, "Johan")
+            elseif stock(p, "Cloth") < 1 then
+                kit.status("Gathering cloth for Johan.")
+                gatherOne(kit, "Cloth")
+            elseif stock(p, WOOD) < WOOD_NEEDED then
+                buyWood(kit)
+            else
+                if talkTo(kit, "Johan") then closeDialogue(kit) end
+            end
+            return true
+        end
+        return false
+    end
+
+    -- the grimoire quest's next task: the first not done whose prerequisite is (Trials.lua:105-111 lists them in order, each task's Prereq names the one before)
+    local function nextTask(found)
+        local tasks = found:FindFirstChild("Tasks")
+        if not tasks then return nil end
+        for _, entry in ipairs(tasks:GetChildren()) do
+            local progress, max = entry:GetAttribute("TaskProgress"), entry:GetAttribute("TaskMax")
+            local done = type(progress) == "number" and type(max) == "number" and progress >= max
+            local prereq = entry:GetAttribute("Prereq")
+            local open = type(prereq) ~= "string" or prereq == "" or (function()
+                local before = tasks:FindFirstChild(prereq)
+                local p2, m2 = before and before:GetAttribute("TaskProgress"), before and before:GetAttribute("TaskMax")
+                return type(p2) == "number" and type(m2) == "number" and p2 >= m2
+            end)()
+            if not done and open then return entry end
+        end
+        return nil
+    end
+
+    local function waitForMagic(kit, seconds)
+        local limit = os.clock() + seconds
+        while os.clock() < limit do
+            local f = folder()
+            local magic = f and f:GetAttribute("Magic")
+            if type(magic) == "string" and magic ~= "" and magic ~= "None" then return true end
+            if not kit.sleep(1) then return false end
+        end
+        return false
+    end
+
+    -- the grimoire quest, task by task: each tracked spot gone to, Merlin talked to when a task names him, and the ceremony waited out in the hall (the magic is decided there; the later inner realm steps don't change it)
+    local function grimoire(kit)
+        local p = player()
+        local found = quest(p, "GrimoireQuest")
+        if not found then
+            local merlin = npc("Merlin")
+            local here = kit.position()
+            if here and (here - MERLIN).Magnitude > 20 then
+                kit.status("Heading to Merlin on the Magic Tower.")
+                kit.travel(MERLIN, { reach = 8 })
+            elseif merlin then
+                take(kit, "Merlin")
+            else
+                kit.status("Waiting for Merlin to show up.")
+                kit.sleep(2)
+            end
+            return
+        end
+        local entry = nextTask(found)
+        if not entry then
+            if not waitForMagic(kit, 5) and talkTo(kit, "Merlin") then closeDialogue(kit) end
+            return
+        end
+        local name = entry.Name
+        local track = entry:GetAttribute("TrackPosition")
+        local radius = tonumber(entry:GetAttribute("TrackRadius")) or 10
+        local here = kit.position()
+        if typeof(track) == "Vector3" and track.Magnitude > 1 and here and (here - track).Magnitude > math.max(radius * 0.5, 6) then
+            kit.status(("Grimoire quest: %s."):format(name))
+            kit.travel(track, { reach = math.max(math.min(radius * 0.4, 12), 4) })
+            return
+        end
+        -- "Seek out the whispers of mana" and "Return to Merlin" both mean talking to him (live: the first ticks as his dialogue opens)
+        if name:find("Merlin") or name:find("whispers") then
+            if talkTo(kit, "Merlin") then closeDialogue(kit) end
+            return
+        end
+        if name:find("Ceremony") then
+            kit.status("Waiting for your grimoire ceremony.")
+            if not waitForMagic(kit, CEREMONY_WAIT) and (kit.position() - HALL).Magnitude > 10 then kit.travel(HALL, { reach = 6 }) end
+            return
+        end
+        kit.status(("Grimoire quest: %s."):format(name))
+        waitForMagic(kit, 3)
+    end
+
+    local function wanted(magic, variant)
+        if not cfg.wanted[magic] then return false end
+        if next(cfg.variants) == nil then return true end
+        return cfg.variants[variant] == true
+    end
+
+    function brain.step(kit)
+        local p = player()
+        local f = folder()
+        if not f then
+            kit.sleep(1)
+            return
+        end
+        local Slots = kit.api("Slots")
+        if not p:GetAttribute("Loaded") and Slots then
+            kit.status("Getting past the loading screen.")
+            Slots.pressToContinue()
+            return
+        end
+        if next(cfg.wanted) == nil then
+            kit.status("Pick the magic you want to keep.")
+            kit.sleep(1)
+            return
+        end
+
+        local magic, variant = f:GetAttribute("Magic"), f:GetAttribute("MagicVariant")
+        if type(magic) == "string" and magic ~= "" and magic ~= "None" then
+            local state = cfg.state
+            if state.lastMagic ~= magic or state.lastLevel ~= f:GetAttribute("Level") then
+                state.rolls = (state.rolls or 0) + 1
+                state.lastMagic, state.lastVariant, state.lastLevel = magic, variant, f:GetAttribute("Level")
+                state.history = state.history or {}
+                table.insert(state.history, 1, ("%s (%s)"):format(magic, tostring(variant or "Default")))
+                while #state.history > 10 do table.remove(state.history) end
+                cfg.save(state)
+            end
+            if wanted(magic, variant) then
+                -- a roll you keep still has Merlin to go back to for the grimoire; the inner realm step after that is yours
+                local found = quest(p, "GrimoireQuest")
+                local entry = found and nextTask(found)
+                if entry and entry.Name:find("Merlin") and merlinVisits < MERLIN_TRIES then
+                    merlinVisits = merlinVisits + 1
+                    kit.status(("You got %s magic. Going back to Merlin with it."):format(magic))
+                    if talkTo(kit, "Merlin") then closeDialogue(kit) end
+                    kit.sleep(1)
+                    return
+                end
+                kit.status(("You got %s magic. Keeping it."):format(magic))
+                cfg.onKept(magic, variant)
+                return
+            end
+            local level = tonumber(f:GetAttribute("Level")) or 0
+            if not cfg.allowWipe then
+                kit.status(("Got %s, which you didn't pick. Switch on Allow Wipes to roll again."):format(magic))
+                kit.sleep(2)
+                return
+            end
+            if level > cfg.maxLevel then
+                kit.status(("This character is level %d, over your wipe limit of %d, so it won't be wiped."):format(level, cfg.maxLevel))
+                kit.sleep(2)
+                return
+            end
+            local okSlot, slot = false, nil
+            if Slots then okSlot, slot = Slots.current() end
+            if not okSlot then
+                kit.sleep(1)
+                return
+            end
+            if menuAskedAt and os.clock() - menuAskedAt < MENU_RETRY then
+                kit.sleep(1)
+                return
+            end
+            state.pendingWipe = slot
+            cfg.save(state)
+            kit.status(("Got %s, not one you picked. Going to the menu to wipe and roll again."):format(magic))
+            menuAskedAt = os.clock()
+            Slots.toMenu()
+            kit.sleep(2)
+            return
+        end
+
+        if f:GetAttribute("StarterWeaponChosen") ~= true then
+            local CloverNet = kit.api("CloverNet")
+            kit.status(("Picking the %s."):format(cfg.weapon))
+            if CloverNet then CloverNet.call("StarterQuest", cfg.weapon) end
+            kit.sleep(1)
+            return
+        end
+
+        if starter(kit) then return end
+
+        local level = tonumber(f:GetAttribute("Level")) or 0
+        if level < GRIMOIRE_LEVEL then
+            if stock(p, BROOM) < 1 then
+                kit.status("You need a broom to race. Finish Johan's quest first.")
+                kit.sleep(2)
+                return
+            end
+            race.step(kit)
+            return
+        end
+        grimoire(kit)
+    end
+
+    return brain
+end
+
+return M
 
 end)
 __bundle_register("Features/Clover/Farm/Races", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -42480,6 +43878,182 @@ end
 return M
 
 end)
+__bundle_register("Features/Clover/Farm/Nodes", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- gathering farm brain: latches onto the nearest ready node of the chosen resources that your tools can gather until it is gathered, flies over on the broom, lands beside it and plays the gather through the professions api (its solver answers the minigame), and heads back to where it was gathering when nothing nearby is ready
+local M = {}
+
+local KINDS = { "Ore", "Harvest" }
+local SEARCH = 3000
+-- the gather prompt is fired from here; a node it could not gather twice is left alone for a while
+local REACH = 5
+local FAILS = 2
+local SKIP_FOR = 90
+local WAIT = 3
+local GATHER_TIMEOUT = 40
+local HOME_FAR = 300
+
+local function distance(a, b)
+    return (a - b).Magnitude
+end
+
+local function chosenList(items)
+    local out = {}
+    for name, on in pairs(items) do
+        if on then out[#out + 1] = name end
+    end
+    table.sort(out)
+    return out
+end
+
+local function describe(list)
+    if #list == 1 then return list[1] end
+    if #list == 2 then return list[1] .. " or " .. list[2] end
+    return "the resources you picked"
+end
+
+-- cfg is the live settings table the menu writes: items (a set) and ownTools
+function M.new(cfg)
+    local brain = {}
+    local node = nil
+    local skipped, failures = {}, {}
+
+    function brain.begin()
+        node, skipped, failures = nil, {}, {}
+    end
+
+    local function codeName(Professions, code)
+        local errors = Professions.Errors
+        if type(errors) ~= "table" then return nil end
+        for name, value in pairs(errors) do
+            if value == code then return name end
+        end
+        return nil
+    end
+
+    local function pick(kit, Professions)
+        local here = kit.position()
+        if not here then return nil end
+        local now = os.clock()
+        local best = nil
+        -- the professions filter takes a set of true values only
+        local wanted = {}
+        for name, on in pairs(cfg.items) do
+            if on then wanted[name] = true end
+        end
+        for _, kind in ipairs(KINDS) do
+            local filter = { kind = kind, items = wanted, available = true, origin = here, maxDistance = SEARCH, limit = 8 }
+            local usable = true
+            if cfg.ownTools then
+                local okPower, power = Professions.toolPower(kind)
+                if okPower and (tonumber(power) or 0) > 0 then
+                    filter.maxPower = power
+                elseif okPower then
+                    usable = false
+                end
+            end
+            if usable then
+                local ok, list = Professions.nodes(filter)
+                if ok and type(list) == "table" then
+                    for _, entry in ipairs(list) do
+                        local skipUntil = skipped[entry.record]
+                        if not skipUntil or skipUntil < now then
+                            if not best or entry.distance < best.distance then best = entry end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local function fail(entry)
+        failures[entry.record] = (failures[entry.record] or 0) + 1
+        if failures[entry.record] >= FAILS then
+            skipped[entry.record] = os.clock() + SKIP_FOR
+            failures[entry.record] = nil
+        end
+        node = nil
+    end
+
+    function brain.step(kit)
+        local items = chosenList(cfg.items)
+        if #items == 0 then
+            kit.status("Pick the resources to gather.")
+            kit.sleep(1)
+            return
+        end
+        local Professions = kit.api("Professions")
+        if not Professions then
+            kit.status("Gathering isn't ready yet.")
+            kit.sleep(1)
+            return
+        end
+        if node and not cfg.items[node.item] then node = nil end
+        if not node then
+            node = pick(kit, Professions)
+            if not node then
+                local home, here = kit.home(), kit.position()
+                if home and here and distance(home, here) > HOME_FAR then
+                    kit.status("Heading back to where you were gathering.")
+                    kit.travel(home, { reach = 20 })
+                    return
+                end
+                kit.status(("No %s ready nearby. Waiting for one to grow back."):format(describe(items)))
+                kit.sleep(WAIT)
+                return
+            end
+        end
+
+        local here = kit.position()
+        if not here then return end
+        local gap = distance(here, node.position)
+        if gap > REACH + 1 then
+            kit.status(("Flying to %s (%d studs away)."):format(node.item, math.floor(gap)))
+            local ok, why = kit.travel(node.position, { reach = REACH })
+            if not ok and why ~= "stopped" then fail(node) end
+            return
+        end
+        if kit.flying() then
+            kit.status("Landing to gather.")
+            kit.land()
+            return
+        end
+        kit.setHome(node.position)
+        kit.status(("Gathering %s."):format(node.item))
+        local ok, result = Professions.gather(node, { timeout = GATHER_TIMEOUT })
+        if ok then
+            kit.add("gathered")
+            if type(result) == "table" and type(result.stockDelta) == "table" then
+                for item, count in pairs(result.stockDelta) do
+                    if type(count) == "number" and count > 0 then kit.addItem(item, count) end
+                end
+            end
+            failures[node.record] = nil
+            node = nil
+            return
+        end
+        local why = codeName(Professions, result)
+        if why == "BUSY" then
+            kit.sleep(0.5)
+        elseif why == "NONE" then
+            -- an emptied node the registry still lists would be picked again straight away
+            skipped[node.record] = os.clock() + SKIP_FOR
+            failures[node.record] = nil
+            node = nil
+        else
+            -- a node with no prompt from right beside it counts as a miss too, or the farm stands on it for good
+            fail(node)
+            kit.sleep(0.5)
+        end
+    end
+
+    return brain
+end
+
+return M
+
+end)
 __bundle_register("Features/Clover/Farm/Quests", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- quest farm brain: works through the repeatable quests you pick: takes one whose giver is off cooldown (nearest first), does its tasks with the farm's own brains (the gathering farm for a gather, the mob farm for a hunt where the quest points, the race farm for a race) or by hand (a 'Hit the ...' task, struck with light attacks; an item no node gives, bought at a shop), hands it in at the giver and goes on, waiting out the cooldowns when every quest is resting; a quest it has no way to do is left alone
 local Services = require("Services")
@@ -43046,178 +44620,6 @@ end
 return M
 
 end)
-__bundle_register("Features/Clover/Farm/Nodes", function(require, _LOADED, __bundle_register, __bundle_modules)
--- gathering farm brain: latches onto the nearest ready node of the chosen resources that your tools can gather until it is gathered, flies over on the broom, lands beside it and plays the gather through the professions api (its solver answers the minigame), and heads back to where it was gathering when nothing nearby is ready
-local M = {}
-
-local KINDS = { "Ore", "Harvest" }
-local SEARCH = 3000
--- the gather prompt is fired from here; a node it could not gather twice is left alone for a while
-local REACH = 5
-local FAILS = 2
-local SKIP_FOR = 90
-local WAIT = 3
-local GATHER_TIMEOUT = 40
-local HOME_FAR = 300
-
-local function distance(a, b)
-    return (a - b).Magnitude
-end
-
-local function chosenList(items)
-    local out = {}
-    for name, on in pairs(items) do
-        if on then out[#out + 1] = name end
-    end
-    table.sort(out)
-    return out
-end
-
-local function describe(list)
-    if #list == 1 then return list[1] end
-    if #list == 2 then return list[1] .. " or " .. list[2] end
-    return "the resources you picked"
-end
-
--- cfg is the live settings table the menu writes: items (a set) and ownTools
-function M.new(cfg)
-    local brain = {}
-    local node = nil
-    local skipped, failures = {}, {}
-
-    function brain.begin()
-        node, skipped, failures = nil, {}, {}
-    end
-
-    local function codeName(Professions, code)
-        local errors = Professions.Errors
-        if type(errors) ~= "table" then return nil end
-        for name, value in pairs(errors) do
-            if value == code then return name end
-        end
-        return nil
-    end
-
-    local function pick(kit, Professions)
-        local here = kit.position()
-        if not here then return nil end
-        local now = os.clock()
-        local best = nil
-        -- the professions filter takes a set of true values only
-        local wanted = {}
-        for name, on in pairs(cfg.items) do
-            if on then wanted[name] = true end
-        end
-        for _, kind in ipairs(KINDS) do
-            local filter = { kind = kind, items = wanted, available = true, origin = here, maxDistance = SEARCH, limit = 8 }
-            local usable = true
-            if cfg.ownTools then
-                local okPower, power = Professions.toolPower(kind)
-                if okPower and (tonumber(power) or 0) > 0 then
-                    filter.maxPower = power
-                elseif okPower then
-                    usable = false
-                end
-            end
-            if usable then
-                local ok, list = Professions.nodes(filter)
-                if ok and type(list) == "table" then
-                    for _, entry in ipairs(list) do
-                        local skipUntil = skipped[entry.record]
-                        if not skipUntil or skipUntil < now then
-                            if not best or entry.distance < best.distance then best = entry end
-                            break
-                        end
-                    end
-                end
-            end
-        end
-        return best
-    end
-
-    local function fail(entry)
-        failures[entry.record] = (failures[entry.record] or 0) + 1
-        if failures[entry.record] >= FAILS then
-            skipped[entry.record] = os.clock() + SKIP_FOR
-            failures[entry.record] = nil
-        end
-        node = nil
-    end
-
-    function brain.step(kit)
-        local items = chosenList(cfg.items)
-        if #items == 0 then
-            kit.status("Pick the resources to gather.")
-            kit.sleep(1)
-            return
-        end
-        local Professions = kit.api("Professions")
-        if not Professions then
-            kit.status("Gathering isn't ready yet.")
-            kit.sleep(1)
-            return
-        end
-        if node and not cfg.items[node.item] then node = nil end
-        if not node then
-            node = pick(kit, Professions)
-            if not node then
-                local home, here = kit.home(), kit.position()
-                if home and here and distance(home, here) > HOME_FAR then
-                    kit.status("Heading back to where you were gathering.")
-                    kit.travel(home, { reach = 20 })
-                    return
-                end
-                kit.status(("No %s ready nearby. Waiting for one to grow back."):format(describe(items)))
-                kit.sleep(WAIT)
-                return
-            end
-        end
-
-        local here = kit.position()
-        if not here then return end
-        local gap = distance(here, node.position)
-        if gap > REACH + 1 then
-            kit.status(("Flying to %s (%d studs away)."):format(node.item, math.floor(gap)))
-            local ok, why = kit.travel(node.position, { reach = REACH })
-            if not ok and why ~= "stopped" then fail(node) end
-            return
-        end
-        if kit.flying() then
-            kit.status("Landing to gather.")
-            kit.land()
-            return
-        end
-        kit.setHome(node.position)
-        kit.status(("Gathering %s."):format(node.item))
-        local ok, result = Professions.gather(node, { timeout = GATHER_TIMEOUT })
-        if ok then
-            kit.add("gathered")
-            if type(result) == "table" and type(result.stockDelta) == "table" then
-                for item, count in pairs(result.stockDelta) do
-                    if type(count) == "number" and count > 0 then kit.addItem(item, count) end
-                end
-            end
-            failures[node.record] = nil
-            node = nil
-            return
-        end
-        local why = codeName(Professions, result)
-        if why == "NOT_STREAMED" or why == "BUSY" then
-            kit.sleep(0.5)
-        elseif why == "NONE" then
-            node = nil
-        else
-            fail(node)
-            kit.sleep(0.5)
-        end
-    end
-
-    return brain
-end
-
-return M
-
-end)
 __bundle_register("Features/Clover/Farm/Mobs", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- mob farm brain: picks the mob of the chosen kinds it can best take (near, alone, already hurt) and stays on it until it dies, flies over on the broom and lands beside it to fight on foot (the game refuses swings and casts on a broom); with parrying on it fights around the parry: no swing is started that a strike due from the parry api would catch mid-swing (a swinging character's parry is refused), heavies go into the windows the mob's own state attributes say it cannot strike in (stunned, or CantStrike after its attack) and right after a parry lands, lights fill the rest; it watches every frame after a hit for the moment the mob is handed over to finish it with the instakill; without parrying it blocks between swings instead; it never backs off, however low its health
 local M = {}
@@ -43256,6 +44658,8 @@ local PUNISH_TIME = 1
 local SWING_TIME   = { light = 0.6, heavy = 0.95 }
 -- how long a cast keeps the character busy (live 2026-10-24: Scorching Barrage held its state for several seconds of hits)
 local SKILL_TIME   = 2
+-- spells reach from here, so one is thrown before closing in (live 2026-10-25: a magic power 39 mage left its spell unused through a 70 s Raven Blackwood fight it lost on punches)
+local SPELL_RANGE  = 40
 local STRIKE_SLACK = 0.12
 local HOLD_POLL    = 0.03
 
@@ -43321,10 +44725,11 @@ local function describe(list)
     return list[1] .. " or " .. list[2]
 end
 
--- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, dodge (roll through specials), plus locked() for the premium gate, and proper (the boss farm's, whose names take no "a" or "the")
+-- cfg is the live settings table the menu writes: names (a set), heavy, skills, instakill, instakillMode, block, parry, dodge (roll through specials), plus locked() for the premium gate, and the boss farm's proper (names that take no "a" or "the") and stayPut (no flying home when nothing's about)
 function M.new(cfg)
     local function called(name, article)
         if cfg.proper then return name end
+        if article == "a" and name:match("^[AEIOUaeiou]") then article = "an" end
         return article .. " " .. name
     end
 
@@ -43560,6 +44965,17 @@ function M.new(cfg)
         end
         if gap > MELEE then
             guard(kit, false)
+            local due = strikeIn(kit)
+            if cfg.skills and gap <= SPELL_RANGE and (due == nil or due - STRIKE_SLACK >= SKILL_TIME) then
+                local at = rootOf(mob)
+                if at then kit.face(at) end
+                if castReady(kit, Combat) then
+                    target.fought = true
+                    kit.status(("Casting at %s."):format(called(mob.name, "the")))
+                    watchLanding(kit, Combat, mob)
+                    return
+                end
+            end
             kit.status(("Closing in on %s."):format(called(mob.name, "the")))
             kit.travel(function() return rootOf(mob) end, { reach = CHASE_REACH, broom = false, watch = function() return not alive(mob) end })
             return
@@ -43604,8 +45020,8 @@ function M.new(cfg)
             if due then room = due - STRIKE_SLACK end
             local heavyFits = free >= SWING_TIME.heavy and room >= SWING_TIME.heavy
             local swung = false
-            -- a spell channels for seconds with no parry or block, so only a window that long gets one
-            if cfg.skills and (free >= SKILL_TIME or punishing) and room >= SKILL_TIME then swung = castReady(kit, Combat) end
+            -- a spell channels for seconds with no parry or block, so it goes in when no strike is due before it ends, or into a window the mob can't strike in
+            if cfg.skills and (free >= SKILL_TIME or punishing or room >= SKILL_TIME) then swung = castReady(kit, Combat) end
             if not swung and cfg.heavy and heavyFits and not has(kit, HEAVY_COOLDOWN) then swung = Combat.attack("heavy") == true end
             if not swung then swung = Combat.attack("light") == true end
             if swung then
@@ -43667,7 +45083,8 @@ function M.new(cfg)
             local entry = pick(kit, names)
             if not entry then
                 local home, here = kit.home(), kit.position()
-                if home and here and distance(home, here) > HOME_FAR then
+                -- the boss farm picks its own next spot, so it never flies back to the last fight (live 2026-10-25: twice 1,500 studs back to Raven's den after Holda's house had no way in)
+                if home and here and not cfg.stayPut and distance(home, here) > HOME_FAR then
                     kit.status("Heading back to where you were farming.")
                     kit.travel(home, { reach = 20 })
                     return
@@ -43697,6 +45114,8 @@ function M.new(cfg)
         end
         local gap = distance(here, at)
         if gap > FIGHT_RANGE then
+            -- the clock on hurting it only runs within reach (live 2026-10-25: a death and the flight back used up its 40 s, and a full-health Raven Blackwood was benched on arrival)
+            target.since = os.clock()
             guard(kit, false)
             kit.status(("Flying to %s (%d studs away)."):format(called(mob.name, "a"), math.floor(gap)))
             local ok, why = kit.travel(function() return rootOf(mob) end, { reach = APPROACH, watch = function() return not alive(mob) end })
@@ -44175,6 +45594,10 @@ local KNOWN = {
     ["Aldric the Unmastered"] = { Vector3.new(1243, 244, -4469) },
     ["Holda the Witch"]       = { Vector3.new(-902, 88, 1303) },
     ["Raven Blackwood"]       = { Vector3.new(-1778, 51, -13) },
+    -- among the mushmites of the mushroom region (live 2026-10-25)
+    ["Flame Sniper"]          = { Vector3.new(28, 283, -3513) },
+    -- deep in the alke caverns, where forb kravitz's "Exterminate Arachne" task points, a shrine beside it; the movement api's ways in take every trip there through the cave's one mouth
+    ["Arachne Queen"]         = { Vector3.new(217, 543, -6642) },
 }
 
 local function distance(a, b)
@@ -44213,7 +45636,7 @@ end
 -- cfg is the live settings table the menu writes (bosses, a set; loot); shared.mob is the mob farm's settings, which the fighting borrows
 function M.new(cfg, shared)
     local brain = {}
-    local mobCfg = setmetatable({ names = {}, proper = true }, { __index = shared.mob })
+    local mobCfg = setmetatable({ names = {}, proper = true, stayPut = true }, { __index = shared.mob })
     local fighter = Mobs.new(mobCfg)
     local checked, seeds = {}, nil
     local fighting = nil
